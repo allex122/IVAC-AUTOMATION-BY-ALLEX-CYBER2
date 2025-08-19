@@ -1,10 +1,8 @@
-/* ivac-main.js — ALLEX IVAC Automation (Merged Final)
+/* ivac-main.js — ALLEX IVAC Automation (Final + Turnstile Ready)
  * UI: Login | BGD & OTP | Payment — floating, draggable
- * Flows: mobile-verify → login/password or login-otp → token save
- *        application-info-submit → personal-info-submit → overview-submit
- *        pay-otp-sent → pay-otp-verify → pay-slot-time → pay-now
- * Safety: CORS-safe same-origin endpoints, form-POST (no preflight),
- *         per-origin backoff, single-flight OTP, request de-dupe, STOP ALL
+ * CORS-safe: same-origin + form-POST (no preflight)
+ * Turnstile: auto-detect + token capture + attach to critical endpoints
+ * Safety: per-origin backoff, OTP single-flight, request de-dupe, STOP ALL
  * Hotkeys: Alt + D → Add/Edit Data modal
  */
 
@@ -13,19 +11,16 @@
 
   /************** SAME-ORIGIN ENDPOINTS (CORS-SAFE) **************/
   const ORIGIN = window.location.origin; // https://payment.ivacbd.com
-
   const URLS = {
     // Auth
     mobileVerify:       `${ORIGIN}/api/v2/payment/mobile-verify`,
     login:              `${ORIGIN}/api/v2/payment/login`,
     loginOtp:           `${ORIGIN}/api/v2/payment/login-otp`,
-
     // Application
     applicationSubmit:  `${ORIGIN}/api/v2/payment/application-info-submit`,
     personalSubmit:     `${ORIGIN}/api/v2/payment/personal-info-submit`,
     overviewSubmit:     `${ORIGIN}/api/v2/payment/overview-submit`,
     checkout:           `${ORIGIN}/api/v2/payment/checkout`,
-
     // Payment + OTP
     payOtpSend:         `${ORIGIN}/api/v2/payment/pay-otp-sent`,
     payOtpVerify:       `${ORIGIN}/api/v2/payment/pay-otp-verify`,
@@ -79,6 +74,58 @@
   }
   function noteSuccess(url){ const o=originOf(url); backoffMap.set(o, {fail:0, until:0}); }
 
+  /************** TURNSTILE SUPPORT **************/
+  const TS_KEY = "ivac_turnstile_token";
+  let TS_PRESENT = false;
+
+  // Capture latest turnstile token whenever the widget verifies
+  function startTurnstileWatcher() {
+    // 1) hidden input value (most pages use this name)
+    function snapshot() {
+      const inp = document.querySelector('input[name="cf-turnstile-response"]');
+      const val = inp && inp.value ? inp.value.trim() : "";
+      if (val) localStorage.setItem(TS_KEY, val);
+      return val;
+    }
+    snapshot();
+
+    // 2) observe DOM for changes to catch (re)verifications
+    const mo = new MutationObserver(() => snapshot());
+    mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+
+    // 3) hook render callback if available
+    try {
+      if (window.turnstile && typeof window.turnstile.render === "function") {
+        const orig = window.turnstile.render;
+        window.turnstile.render = function(el, opts = {}) {
+          const cb = opts.callback;
+          opts.callback = function(token) {
+            if (token) localStorage.setItem(TS_KEY, token);
+            if (typeof cb === "function") cb(token);
+          };
+          TS_PRESENT = true;
+          return orig.call(this, el, opts);
+        };
+      }
+    } catch {}
+    // 4) passive detector
+    detectTurnstileLoop();
+  }
+
+  function detectTurnstileLoop(){
+    const w = document.querySelector(".cf-turnstile, iframe[src*='challenges.cloudflare']");
+    TS_PRESENT = !!w;
+    if (TS_PRESENT) setStatus("Cloudflare Turnstile detected. Solve before actions.", "#0ea5e9");
+    setTimeout(detectTurnstileLoop, 1500);
+  }
+
+  // bring widget into view to help the user
+  function focusTurnstileWidget() {
+    const w = document.querySelector(".cf-turnstile, iframe[src*='challenges.cloudflare']");
+    if (w) { w.scrollIntoView({behavior:"smooth", block:"center"}); w.style.outline="3px solid #f59e0b"; setTimeout(()=>w.style.outline="", 1500); }
+    else toast("Turnstile widget not visible here.", false);
+  }
+
   /************** UI **************/
   const css = `
   .alx-root{position:fixed;right:20px;top:20px;z-index:999999;font-family:Inter,Segoe UI,Roboto,system-ui,sans-serif;}
@@ -129,7 +176,70 @@
     });
   }
 
-  // build UI
+  /************** FORM-POST helper (NO PREFLIGHT) **************/
+  async function postForm(url, dataObj, includeAuth=false){
+    await backoffGuard(url);
+
+    // Turnstile token auto-attach where relevant
+    const needTS = /mobile-verify|login|login-otp|pay-otp-sent|pay-now/i.test(url);
+    if (needTS) {
+      const t = localStorage.getItem(TS_KEY) || "";
+      if (!t) setStatus("Turnstile token missing. Click 'Solve Turnstile' and try again.", "#b45309");
+      if (t) dataObj = { ...(dataObj||{}), "cf-turnstile-response": t };
+    }
+
+    const body = new URLSearchParams();
+    Object.entries(dataObj || {}).forEach(([k,v]) => body.append(k, v ?? ""));
+
+    const headers = { "accept": "application/json" };
+    if (includeAuth && bearerToken) headers["authorization"] = `Bearer ${bearerToken}`;
+
+    // de-dupe
+    const sig = makeSig(url, "POST", dataObj);
+    if (dedupe.has(sig)) return {ok:false, msg:"Duplicate request suppressed"};
+    dedupe.add(sig); setTimeout(()=>dedupe.delete(sig), 800);
+
+    const ac = new AbortController(); const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
+
+    try{
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body,
+        credentials: "include",
+        redirect: "manual",
+        signal: ac.signal
+      });
+      active.delete(id);
+
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        setStatus("Redirect detected → অন্য origin? Same-origin রাখো.", "#b45309");
+        return {ok:false, msg:"redirect"};
+      }
+      if ([403,419,429,503].includes(res.status)) {
+        noteFailure(url);
+        if (res.status===429) setStatus("Rate limited. Retrying later…", "#b45309");
+        if (res.status===403 || res.status===419) setStatus("CF/Session challenge — first solve Turnstile, then retry.", "#b91c1c");
+        return {ok:false, msg:`HTTP ${res.status}`};
+      }
+      if (!res.ok) { noteFailure(url); return {ok:false, msg:`HTTP ${res.status}`}; }
+
+      noteSuccess(url);
+      const data = await res.json().catch(()=> ({}));
+      return {ok:true, data, msg: data?.message || data?.msg || "OK"};
+    }catch(e){
+      active.delete(id); noteFailure(url);
+      return {ok:false, msg:e.message || "Network/CORS"};
+    }
+  }
+
+  function stopCurrent(){
+    const last = Array.from(active.values()).pop();
+    if (last){ last.abort(); toast("Stopped current"); }
+  }
+  function stopAll(){ active.forEach(ac=>ac.abort()); active.clear(); toast("Stopped all"); }
+
+  /************** UI BUILD **************/
   function buildUI(){
     injectCSS();
     const root = document.createElement("div"); root.className="alx-root";
@@ -164,72 +274,21 @@
     }
   }
 
-  // inputs / rows / buttons
+  // small UI helpers
   function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
   function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
   function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
   function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
-
-  /************** FORM-POST helper (NO PREFLIGHT) **************/
-  async function postForm(url, dataObj, includeAuth=false){
-    await backoffGuard(url);
-
-    const body = new URLSearchParams();
-    Object.entries(dataObj || {}).forEach(([k,v]) => body.append(k, v ?? ""));
-
-    const headers = { "accept": "application/json" };
-    if (includeAuth && bearerToken) headers["authorization"] = `Bearer ${bearerToken}`;
-
-    // de-dupe
-    const sig = makeSig(url, "POST", dataObj);
-    if (dedupe.has(sig)) return {ok:false, msg:"Duplicate request suppressed"};
-    dedupe.add(sig); setTimeout(()=>dedupe.delete(sig), 800);
-
-    const ac = new AbortController(); const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
-
-    try{
-      const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body,
-        credentials: "include",
-        redirect: "manual",
-        signal: ac.signal
-      });
-      active.delete(id);
-
-      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
-        setStatus("Redirect detected → অন্য origin? Same-origin রাখো.", "#b45309");
-        return {ok:false, msg:"redirect"};
-      }
-      if ([403,419,429,503].includes(res.status)) {
-        noteFailure(url);
-        if (res.status===429) setStatus("Rate limited. Retrying later…", "#b45309");
-        if (res.status===403 || res.status===419) setStatus("CF/Session challenge — পেজে যা চাইছে আগে সেটি কমপ্লিট করে আবার চেষ্টা করুন.", "#b91c1c");
-        return {ok:false, msg:`HTTP ${res.status}`};
-      }
-      if (!res.ok) { noteFailure(url); return {ok:false, msg:`HTTP ${res.status}`}; }
-
-      noteSuccess(url);
-      const data = await res.json().catch(()=> ({}));
-      return {ok:true, data, msg: data?.message || data?.msg || "OK"};
-    }catch(e){
-      active.delete(id); noteFailure(url);
-      return {ok:false, msg:e.message || "Network/CORS"};
-    }
-  }
-
-  function stopCurrent(){
-    const last = Array.from(active.values()).pop();
-    if (last){ last.abort(); toast("Stopped current"); }
-  }
-  function stopAll(){ active.forEach(ac=>ac.abort()); active.clear(); toast("Stopped all"); }
 
   /************** VIEWS **************/
   function loginView(){
     const box = document.createElement("div");
 
     const ready = input("Ready"); ready.disabled = true;
+
+    // NEW: Solve Turnstile helper button
+    const tsBtn = button("SOLVE TURNSTILE","b-purple", focusTurnstileWidget);
+
     const mobile = input("Enter mobile number (11 digits)");
     const pass = input("Enter password","password");
     const otp = input("Enter 6-digit OTP");
@@ -250,18 +309,18 @@
     const rowStop = row( button("STOP CURRENT","b-red", stopCurrent),
                          button("STOP ALL","b-red", stopAll) );
 
-    box.append(ready, mobile, row1, pass, row2, otp, row3, copyBtn, rowStop);
+    box.append(ready, tsBtn, mobile, row1, pass, row2, otp, row3, copyBtn, rowStop);
 
     async function onMobileVerify(){
       const num = mobile.value.trim();
       if(!/^\d{11}$/.test(num)){ toast("Invalid mobile number", false); return; }
-      const res = await postForm(URLS.mobileVerify, { mobile: num });
+      const res = await postForm(URLS.mobileVerify, { mobile_no: num });
       res.ok ? toast("Verification sent") : toast(res.msg || "Failed", false);
     }
     async function onLoginWithPassword(){
       const num=mobile.value.trim(), pw=pass.value;
       if(!/^\d{11}$/.test(num) || !pw){ toast("Mobile/password required", false); return; }
-      const res = await postForm(URLS.login, { mobile:num, password:pw });
+      const res = await postForm(URLS.login, { mobile_no:num, password:pw });
       if(res.ok){
         bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
         toast("Logged in (password) ✓");
@@ -273,7 +332,7 @@
       if(!/^\d{11}$/.test(num) || !/^\d{6}$/.test(code)){ toast("Mobile/OTP required", false); return; }
       otpFlight = true;
       try{
-        const res = await postForm(URLS.loginOtp, { mobile:num, otp:code });
+        const res = await postForm(URLS.loginOtp, { mobile_no:num, otp:code });
         if(res.ok){
           bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
           toast("OTP verified! Token saved ✓");
@@ -431,6 +490,7 @@
 
   /************** ENTRY **************/
   buildUI();
+  startTurnstileWatcher(); // Turnstile detect + token capture
 
   // keyboard shortcut
   window.addEventListener("keydown", (e)=>{
@@ -438,6 +498,6 @@
   });
 
   // quick hooks
-  window.__IVAC__ = { openDataModal, stopAll };
+  window.__IVAC__ = { openDataModal, stopAll, focusTurnstileWidget };
 
 })();
