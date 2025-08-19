@@ -1,39 +1,42 @@
-/* ivac-main.js — ALLEX IVAC Automation (Merged + Native Mobile Verify)
- * - Same-origin endpoints (https://payment.ivacbd.com)
- * - URL-encoded form POST (no preflight), credentials: include
- * - Turnstile token auto-capture (captcha_token / cf-turnstile-response)
- * - **Mobile-verify uses native form submit** (keeps hidden CSRF/refs)
- * - Per-origin backoff, OTP single-flight, request de-dupe
- * - Fallback router: /api/v2/payment → /api/payment → /api/v2
- * - UI: Login | BGD & OTP | Payment + “SOLVE TURNSTILE”
- * - Hotkey: Alt + D → Add/Edit Data modal
+/* ivac-main.js — ALLEX IVAC Automation (Merged Final)
+ * UI: Login | BGD & OTP | Payment — floating, draggable
+ * Flows: mobile-verify → login/password or login-otp → token save
+ *        application-info-submit → personal-info-submit → overview-submit
+ *        pay-otp-sent → pay-otp-verify → pay-slot-time → pay-now
+ * Safety: CORS-safe same-origin endpoints, form-POST (no preflight),
+ *         per-origin backoff, single-flight OTP, request de-dupe, STOP ALL
+ * Hotkeys: Alt + D → Add/Edit Data modal
  */
 
 (() => {
   'use strict';
 
-  /************** CONFIG **************/
-  const ORIGIN = location.origin; // https://payment.ivacbd.com
-  const ROUTE_BASES = [
-    `${ORIGIN}/api/v2/payment`,
-    `${ORIGIN}/api/payment`,
-    `${ORIGIN}/api/v2`,
-  ];
-  const EP = (base) => ({
-    mobileVerify:  `${base}/mobile-verify`,
-    login:         `${base}/login`,
-    loginOtp:      `${base}/login-otp`,
-    appSubmit:     `${base}/application-info-submit`,
-    perSubmit:     `${base}/personal-info-submit`,
-    overview:      `${base}/overview-submit`,
-    slotTime:      `${base}/pay-slot-time`,
-    payOtpSend:    `${base}/pay-otp-sent`,
-    payOtpVerify:  `${base}/pay-otp-verify`,
-    payNow:        `${base}/pay-now`,
-    checkout:      `${base}/checkout`,
-  });
+  /************** SAME-ORIGIN ENDPOINTS (CORS-SAFE) **************/
+  const ORIGIN = "https://api-payment.ivacbd.com";
 
-  const UI_TXT = { title: "Allex@cyber2", v: "v3.3 | ALLEX | Updated" };
+  const URLS = {
+    // Auth
+    mobileVerify: `${ORIGIN}/api/v2/mobile-verify`,
+    login: `https://payment.ivacbd.com/api/v2/payment/login`,
+    loginOtp: `https://payment.ivacbd.com/api/v2/payment/login-otp`,
+
+    // Application
+    applicationSubmit: `https://payment.ivacbd.com/api/v2/payment/application-info-submit`,
+    personalSubmit: `https://payment.ivacbd.com/api/v2/payment/personal-info-submit`,
+    overviewSubmit: `https://payment.ivacbd.com/api/v2/payment/overview-submit`,
+    checkout: `https://payment.ivacbd.com/api/v2/payment/checkout`,
+
+    // Payment + OTP
+    payOtpSend: `https://payment.ivacbd.com/api/v2/payment/pay-otp-sent`,
+    payOtpVerify: `https://payment.ivacbd.com/api/v2/payment/pay-otp-verify`,
+    slotTime: `https://payment.ivacbd.com/api/v2/payment/pay-slot-time`,
+    payNow: `https://payment.ivacbd.com/api/v2/payment/pay-now`
+  };
+
+  const UI_TXT = {
+    title: "Allex@cyber2",
+    v: "v4.1 | ALLEX | Updated" // UPDATE: Bumped version
+  };
 
   /************** STATE **************/
   const kv = {
@@ -42,23 +45,43 @@
     read(path, def=null){
       if(!path.includes(".")) return (this.k[path] ?? def);
       const seg = path.split("."); let t = this.k;
-      for (const s of seg){ if(t == null) return def; t = t[s]; }
+      for(const s of seg){ if(t == null) return def; t = t[s]; }
       return (t ?? def);
     },
     write(key, val){ const x=this.k; x[key]=val; this.k=x; },
+    remove(key){ const x=this.k; delete x[key]; this.k=x; },
   };
 
-  let bearerToken = kv.read("bearerToken","");     // saved after login/otp
-  const active = new Map();                        // id -> AbortController
-  const dedupe = new Set();                        // signature set
-  const backoff = new Map();                       // origin -> {fail, until}
+  let bearerToken = kv.read("bearerToken","");
+  let active = new Map();
+  let dedupe = new Set();
+  const backoffMap = new Map();
   let otpFlight = false;
 
-  const TS_KEY = "ivac_turnstile_token";
-  let TS_PRESENT = false;
+  function makeSig(url, method, body){ return `${method}:${url}:${body?JSON.stringify(body).slice(0,200):""}`; }
+  function originOf(url){ try{ return new URL(url).origin; }catch{ return "default"; } }
+  function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+  function now(){ return Date.now(); }
 
+  async function backoffGuard(url){
+    const o = originOf(url); const ent = backoffMap.get(o);
+    if (ent && ent.until && ent.until > now()){
+      const wait = ent.until - now();
+      setStatus(`Backoff ${Math.ceil(wait/1000)}s…`, "#c77d00");
+      await sleep(wait);
+    }
+  }
+  function noteFailure(url){
+    const o = originOf(url); const ent = backoffMap.get(o) || {fail:0, until:0};
+    ent.fail = Math.min(ent.fail+1, 4);
+    const wait = Math.floor((2 ** ent.fail) * 200 + Math.random()*100);
+    ent.until = now() + wait; backoffMap.set(o, ent);
+  }
+  function noteSuccess(url){ const o=originOf(url); backoffMap.set(o, {fail:0, until:0}); }
+
+  /************** UI **************/
   const css = `
-  .alx-root{position:fixed;right:20px;top:20px;z-index:999999;font-family:Inter,Segoe UI,Roboto,system-ui,sans-serif}
+  .alx-root{position:fixed;right:20px;top:20px;z-index:999999;font-family:Inter,Segoe UI,Roboto,system-ui,sans-serif;}
   .alx-card{width:420px;background:#fff;border-radius:14px;border:2px solid #0b285a;box-shadow:0 10px 30px rgba(0,0,0,.15);overflow:hidden}
   .alx-head{padding:10px 14px;background:linear-gradient(135deg,#0b285a,#123c85);color:#fff;font-weight:700;text-align:center;cursor:move;user-select:none}
   .alx-tabs{display:flex;border-bottom:1px solid #eee}
@@ -83,165 +106,30 @@
   .alx-x{position:absolute;top:10px;right:14px;cursor:pointer;font-weight:800}
   `;
 
-  /************** UTIL **************/
-  const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
-  const now = ()=> Date.now();
-  const makeSig = (url, method, body)=> `${method}:${url}:${body?JSON.stringify(body).slice(0,200):""}`;
-
-  async function backoffGuard(url){
-    const o = new URL(url).origin;
-    const ent = backoff.get(o);
-    if (ent && ent.until && ent.until > now()) await sleep(ent.until - now());
-  }
-  function noteFail(url){
-    const o = new URL(url).origin; const ent = backoff.get(o) || {fail:0, until:0};
-    ent.fail = Math.min(ent.fail+1, 6);
-    ent.until = now() + Math.floor((2 ** ent.fail) * 400 + Math.random()*300);
-    backoff.set(o, ent);
-  }
-  function noteOk(url){ const o = new URL(url).origin; backoff.set(o, {fail:0, until:0}); }
-
   function injectCSS(){ if(document.getElementById("alx-style")) return; const st=document.createElement("style"); st.id="alx-style"; st.textContent=css; document.head.appendChild(st); }
-  function toast(msg, ok=true){ const t=document.createElement("div"); t.className="alx-toast"; t.textContent=msg; t.style.background = ok? "linear-gradient(135deg,#059669,#065f46)":"linear-gradient(135deg,#b91c1c,#7f1d1d)"; document.body.appendChild(t); setTimeout(()=>t.remove(), 2200); }
+
+  function toast(msg, ok=true){
+    const t=document.createElement("div"); t.className="alx-toast"; t.textContent=msg;
+    t.style.background = ok? "linear-gradient(135deg,#059669,#065f46)":"linear-gradient(135deg,#b91c1c,#7f1d1d)";
+    document.body.appendChild(t); setTimeout(()=>t.remove(), 2200);
+  }
 
   let statusEl;
-  function setStatus(msg, color){ if(!statusEl) return; statusEl.textContent=msg; if(color) statusEl.style.color=color; }
-
-  function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
-  function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
-  function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
-  function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
-
-  /************** TURNSTILE **************/
-  function startTurnstileWatcher(){
-    function snapshot(){
-      const inp = document.querySelector('input[name="captcha_token"]') ||
-                  document.querySelector('input[name="cf-turnstile-response"]');
-      const val = inp && inp.value ? inp.value.trim() : "";
-      if (val) localStorage.setItem(TS_KEY, val);
-      return val;
-    }
-    snapshot();
-    const mo = new MutationObserver(()=>snapshot());
-    mo.observe(document.documentElement, {subtree:true, childList:true, attributes:true});
-    try{
-      if (window.turnstile && typeof window.turnstile.render === "function") {
-        const orig = window.turnstile.render;
-        window.turnstile.render = function(el, opts = {}) {
-          const cb = opts.callback;
-          opts.callback = function(token){ if(token) localStorage.setItem(TS_KEY, token); if (typeof cb==="function") cb(token); };
-          TS_PRESENT = true;
-          return orig.call(this, el, opts);
-        };
-      }
-    }catch{}
-    (function loop(){
-      const w = document.querySelector(".cf-turnstile, iframe[src*='challenges.cloudflare']");
-      TS_PRESENT = !!w;
-      if (TS_PRESENT) setStatus("Cloudflare Turnstile detected. Solve before actions.", "#0ea5e9");
-      setTimeout(loop, 1500);
-    })();
-  }
-  function focusTurnstileWidget(){
-    const w = document.querySelector(".cf-turnstile, iframe[src*='challenges.cloudflare']");
-    if (w){ w.scrollIntoView({behavior:"smooth", block:"center"}); w.style.outline="3px solid #f59e0b"; setTimeout(()=>w.style.outline="",1500); }
-    else toast("Turnstile widget not visible here.", false);
+  function setStatus(msg, color){
+    if(!statusEl) return; statusEl.textContent=msg; if(color) statusEl.style.color=color;
   }
 
-  /************** NATIVE MOBILE-VERIFY SUBMIT **************/
-  function nativeMobileVerify(number) {
-    // try to find the exact auth form
-    let form = document.querySelector('form[action*="mobile-verify" i]');
-    if (!form) {
-      const authBox = document.querySelector('.tab-pane.active') ||
-                      document.querySelector('#authentication, .tab-content') ||
-                      document.body;
-      form = authBox && authBox.querySelector('form');
-    }
-    if (!form) { toast("Could not find auth form. Update selector.", false); return false; }
-
-    // set mobile input
-    const mobileInp =
-      form.querySelector('input[name="mobile_no" i]') ||
-      document.querySelector('input[name="mobile_no" i]');
-    if (mobileInp) {
-      mobileInp.value = number;
-      mobileInp.dispatchEvent(new Event('input', {bubbles:true}));
-      mobileInp.dispatchEvent(new Event('change', {bubbles:true}));
-    }
-
-    // attach turnstile token
-    const t = localStorage.getItem(TS_KEY) ||
-              (document.querySelector('input[name="captcha_token"]')||{}).value ||
-              (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
-    let tsInp =
-      form.querySelector('input[name="captcha_token" i]') ||
-      form.querySelector('input[name="cf-turnstile-response" i]');
-    if (!tsInp && t) { tsInp = document.createElement('input'); tsInp.type='hidden'; tsInp.name='captcha_token'; form.appendChild(tsInp); }
-    if (tsInp && t) tsInp.value = t;
-
-    // submit natively
-    if (typeof form.requestSubmit === 'function') form.requestSubmit();
-    else form.submit();
-    return true;
+  function makeDraggable(el, handle){
+    let dragging=false, offX=0, offY=0;
+    handle.addEventListener("mousedown", e=>{ dragging=true; const r=el.getBoundingClientRect(); offX = e.clientX - r.left; offY = e.clientY - r.top; e.preventDefault(); });
+    document.addEventListener("mouseup", ()=>dragging=false);
+    document.addEventListener("mousemove", e=>{
+      if(!dragging) return; el.style.left = (e.clientX - offX) + "px"; el.style.top = (e.clientY - offY) + "px"; el.style.right="auto";
+    });
   }
 
-  /************** NETWORK (fallback aware) **************/
-  async function postFormMulti(kind, data, needTS=false, includeAuth=false){
-    if (needTS) {
-      const t = localStorage.getItem(TS_KEY) ||
-                (document.querySelector('input[name="captcha_token"]')||{}).value ||
-                (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
-      if (!t) { setStatus("Solve Turnstile first, then try.", "#b45309"); return {ok:false, msg:"turnstile-missing"}; }
-      data = { ...(data||{}), "captcha_token": t };
-      // data["cf-turnstile-response"] = t; // optional
-    }
-
-    const body = new URLSearchParams();
-    Object.entries(data || {}).forEach(([k,v]) => body.append(k, v ?? ""));
-
-    const headers = { accept: "application/json" };
-    if (includeAuth && bearerToken) headers.authorization = `Bearer ${bearerToken}`;
-
-    let lastErr = null;
-    for (const base of ROUTE_BASES) {
-      const url = EP(base)[kind];
-      await backoffGuard(url);
-
-      const sig = makeSig(url, "POST", data);
-      if (dedupe.has(sig)) return {ok:false, msg:"deduped"};
-      dedupe.add(sig); setTimeout(()=>dedupe.delete(sig), 800);
-
-      const ac = new AbortController(); const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
-      try{
-        const res = await fetch(url, { method:"POST", headers, body, credentials:"include", redirect:"manual", signal:ac.signal });
-        active.delete(id);
-
-        if (res.type==="opaqueredirect" || (res.status>=300 && res.status<400)) { lastErr={ok:false,msg:"redirect"}; continue; }
-        if ([403,419,429,503].includes(res.status)) {
-          noteFail(url); lastErr = {ok:false, msg:`HTTP ${res.status}`};
-          if (res.status===429) setStatus("Rate limited. Try again later…", "#b45309");
-          if (res.status===403 || res.status===419) setStatus("CF/Session challenge — Solve Turnstile first.", "#b91c1c");
-          return lastErr;
-        }
-        if (res.status===404 || res.status===405){ lastErr = {ok:false, msg:`HTTP ${res.status}`}; continue; }
-        if (!res.ok){ noteFail(url); lastErr = {ok:false, msg:`HTTP ${res.status}`}; continue; }
-
-        noteOk(url);
-        const data = await res.json().catch(()=> ({}));
-        return {ok:true, data, msg:data?.message||data?.msg||"OK", url};
-      }catch(e){
-        active.delete(id); noteFail(url); lastErr = {ok:false, msg:e.message||"Network"}; continue;
-      }
-    }
-    return lastErr || {ok:false, msg:"no-route"};
-  }
-
-  /************** UI BUILD **************/
-  function injectUI(){
-    if(document.getElementById("alx-style")) return;
-    const st=document.createElement("style"); st.id="alx-style"; st.textContent=css; document.head.appendChild(st);
-
+  function buildUI(){
+    injectCSS();
     const root = document.createElement("div"); root.className="alx-root";
     const card = document.createElement("div"); card.className="alx-card"; root.appendChild(card);
 
@@ -272,76 +160,201 @@
       [tLogin,tBGD,tPay].forEach((t,idx)=> t.classList.toggle("active", idx===i));
       [viewLogin,viewBGD,viewPay].forEach((v,idx)=> v.style.display = idx===i? "block":"none");
     }
-    function makeDraggable(el, handle){
-      let dragging=false, offX=0, offY=0;
-      handle.addEventListener("mousedown", e=>{ dragging=true; const r=el.getBoundingClientRect(); offX = e.clientX - r.left; offY = e.clientY - r.top; e.preventDefault(); });
-      document.addEventListener("mouseup", ()=>dragging=false);
-      document.addEventListener("mousemove", e=>{
-        if(!dragging) return; el.style.left = (e.clientX - offX) + "px"; el.style.top = (e.clientY - offY) + "px"; el.style.right="auto";
-      });
+  }
+
+  function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
+  function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
+  function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
+  function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
+
+  /************** FORM-POST helper (NO PREFLIGHT) **************/
+  async function getCsrfToken() {
+    try {
+      const res = await fetch(`${ORIGIN}/csrf-token`, { credentials: "include" });
+      const data = await res.json();
+      return data.csrf_token || "";
+    } catch (e) {
+      console.error("CSRF token fetch failed:", e.message);
+      return "";
     }
   }
+
+  async function postForm(url, dataObj, includeAuth=false, method="POST") {
+    await backoffGuard(url);
+    let body;
+    if (method === "POST") {
+      body = JSON.stringify(dataObj || {});
+    } else if (method === "GET") {
+      body = undefined;
+    }
+    const headers = {
+      "accept": "application/json",
+      "content-type": method === "POST" ? "application/json" : undefined,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    };
+    if (includeAuth && bearerToken) headers["authorization"] = `Bearer ${bearerToken}`;
+    const csrfToken = await getCsrfToken();
+    if (csrfToken) headers["x-csrf-token"] = csrfToken;
+    const sig = makeSig(url, method, dataObj);
+    if (dedupe.has(sig)) {
+      console.warn(`Duplicate request suppressed: ${sig}`);
+      return { ok: false, msg: "Duplicate request suppressed" };
+    }
+    dedupe.add(sig); setTimeout(() => dedupe.delete(sig), 800);
+    const ac = new AbortController();
+    const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
+    try {
+      console.log(`Sending ${method} to ${url} with body:`, body || "N/A");
+      const res = await fetch(url, {
+        method,
+        headers,
+        body,
+        credentials: "include",
+        redirect: "manual",
+        signal: ac.signal
+      });
+      active.delete(id);
+      console.log(`Response: ${res.status} ${res.statusText}`);
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        setStatus("Redirect detected → অন্য origin? Same-origin রাখো.", "#b45309");
+        return { ok: false, msg: "redirect" };
+      }
+      if ([403, 419, 429, 503].includes(res.status)) {
+        noteFailure(url);
+        const text = await res.text();
+        console.warn(`Error ${res.status}: ${text}`);
+        if (res.status === 429) setStatus("Rate limited. Retrying later…", "#b45309");
+        if (res.status === 403 || res.status === 419) setStatus("CF/Session challenge — পেজে যা চাইছে আগে সেটি কমপ্লিট করে আবার চেষ্টা করুন.", "#b91c1c");
+        return { ok: false, msg: `HTTP ${res.status}: ${text}` };
+      }
+      if (!res.ok || res.status !== 200) {
+        noteFailure(url);
+        const text = await res.text();
+        console.warn(`Error ${res.status}: ${text}`);
+        return { ok: false, msg: `HTTP ${res.status}: ${text}` };
+      }
+      noteSuccess(url);
+      const data = await res.json().catch((e) => {
+        console.error(`JSON parse error: ${e.message}`);
+        return {};
+      });
+      console.log(`Response data:`, data);
+      return { ok: true, data, msg: data?.message || data?.msg || "OK" };
+    } catch (e) {
+      active.delete(id); noteFailure(url);
+      console.error(`Fetch error: ${e.message}`);
+      return { ok: false, msg: e.message || "Network/CORS" };
+    }
+  }
+
+  function stopCurrent(){
+    const last = Array.from(active.values()).pop();
+    if (last){ last.abort(); toast("Stopped current"); }
+  }
+  function stopAll(){ active.forEach(ac=>ac.abort()); active.clear(); toast("Stopped all"); }
 
   /************** VIEWS **************/
   function loginView(){
     const box = document.createElement("div");
 
     const ready = input("Ready"); ready.disabled = true;
-    const tsBtn = button("SOLVE TURNSTILE","b-purple", focusTurnstileWidget);
+    const mobile = input("Enter mobile number (e.g., 01783035512 or +8801712345678)");
+    const captcha = input("Enter CAPTCHA token (leave blank if manual)");
+    const pass = input("Enter password", "password");
+    const otp = input("Enter 6-digit OTP");
 
-    const mobile = input("Enter mobile number (11 digits)");
-    const pass = input("Enter password","password");
-    const otp  = input("Enter 6-digit OTP");
-
-    const row1 = row( button("SEND VERIFICATION","b-green", onMobileVerify),
-                      button("AUTO","b-orange", ()=>setStatus("Auto login…")) );
-    const row2 = row( button("LOGIN WITH PASSWORD","b-blue", onLoginWithPassword),
-                      button("AUTO","b-orange", onLoginWithPassword) );
-    const row3 = row( button("LOGIN WITH OTP","b-purple", onLoginWithOtp),
-                      button("AUTO","b-orange", onLoginWithOtp) );
-
-    const copyBtn = button("COPY ACCESS TOKEN","b-purple",()=>{
-      navigator.clipboard.writeText(bearerToken||""); toast("Access token copied");
+    const row1 = row(
+      button("SEND VERIFICATION", "b-green", onMobileVerify),
+      button("SEND (GET)", "b-orange", () => onMobileVerifyWithMethod("GET"))
+    );
+    const row2 = row(
+      button("LOGIN WITH PASSWORD", "b-blue", onLoginWithPassword),
+      button("AUTO", "b-orange", onLoginWithPassword)
+    );
+    const row3 = row(
+      button("LOGIN WITH OTP", "b-purple", onLoginWithOtp),
+      button("AUTO", "b-orange", onLoginWithOtp)
+    );
+    const copyBtn = button("COPY ACCESS TOKEN", "b-purple", () => {
+      navigator.clipboard.writeText(bearerToken || "");
+      toast("Access token copied");
     });
-    const rowStop = row( button("STOP CURRENT","b-red", stopCurrent),
-                         button("STOP ALL","b-red", stopAll) );
+    const rowStop = row(
+      button("STOP CURRENT", "b-red", stopCurrent),
+      button("STOP ALL", "b-red", stopAll)
+    );
 
-    box.append(ready, tsBtn, mobile, row1, pass, row2, otp, row3, copyBtn, rowStop);
+    box.append(ready, mobile, captcha, row1, pass, row2, otp, row3, copyBtn, rowStop);
 
     async function onMobileVerify(){
-      const num = mobile.value.trim();
-      if(!/^\d{11}$/.test(num)){ toast("Invalid mobile number", false); return; }
+      let num = mobile.value.trim();
+      const capToken = captcha.value.trim() || "";
+      // Ensure 11-digit format if no country code
+      if (!num.startsWith("+880") && /^\d{11}$/.test(num)) {
+        num = `+880${num.slice(2)}`; // Convert 01712345678 to +8801712345678
+      }
+      console.log(`Mobile input: ${num}, CAPTCHA token: ${capToken}`);
+      if (!/^\+?\d{10,12}$/.test(num)) { toast("Invalid mobile number (10-12 digits or +880)", false); return; }
+      setStatus("Sending verification (POST)...");
+      const res = await postForm(URLS.mobileVerify, { mobile_no: num, captcha_token: capToken }); // UPDATE: Preserve full number
+      handleResponse(res);
+    }
 
-      const t = localStorage.getItem(TS_KEY) ||
-                (document.querySelector('input[name="captcha_token"]')||{}).value ||
-                (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
-      if (!t) { setStatus("Solve Turnstile first, then try.", "#b45309"); focusTurnstileWidget(); return; }
-
-      const ok = nativeMobileVerify(num);
-      if (ok) { setStatus("Submitting mobile-verify via native form…", "#0ea5e9"); toast("Submitting…"); }
+    async function onMobileVerifyWithMethod(method){
+      let num = mobile.value.trim();
+      const capToken = captcha.value.trim() || "";
+      if (!num.startsWith("+880") && /^\d{11}$/.test(num)) {
+        num = `+880${num.slice(2)}`;
+      }
+      console.log(`Mobile input: ${num}, CAPTCHA token: ${capToken}, Method: ${method}`);
+      if (!/^\+?\d{10,12}$/.test(num)) { toast("Invalid mobile number (10-12 digits or +880)", false); return; }
+      setStatus(`Sending verification (${method})...`);
+      const res = await postForm(URLS.mobileVerify, { mobile_no: num, captcha_token: capToken }, false, method);
+      handleResponse(res);
     }
 
     async function onLoginWithPassword(){
-      const num = mobile.value.trim(), pw=pass.value;
-      if(!/^\d{11}$/.test(num) || !pw){ toast("Mobile/password required", false); return; }
-      const res = await postFormMulti("login", { mobile_no:num, password:pw }, false, false);
-      if(res?.ok){
-        bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
+      let num = mobile.value.trim(), pw = pass.value;
+      if (!num.startsWith("+880") && /^\d{11}$/.test(num)) {
+        num = `+880${num.slice(2)}`;
+      }
+      console.log(`Mobile: ${num}, Password: ${pw}`);
+      if (!/^\+?\d{10,12}$/.test(num) || !pw) { toast("Mobile/password required", false); return; }
+      setStatus("Logging in with password...");
+      const res = await postForm(URLS.login, { mobile_no: num, password: pw });
+      if (res.ok) {
+        bearerToken = res.data?.access_token || res.data?.token || "";
+        kv.write("bearerToken", bearerToken);
         toast("Logged in (password) ✓");
-      } else toast(res?.msg || "Login failed", false);
+      } else toast(res.msg || "Login failed", false);
     }
     async function onLoginWithOtp(){
-      if(otpFlight){ toast("OTP verify in-progress", false); return; }
-      const num=mobile.value.trim(), code=otp.value.trim();
-      if(!/^\d{11}$/.test(num) || !/^\d{6}$/.test(code)){ toast("Mobile/OTP required", false); return; }
+      if (otpFlight) { toast("OTP verify in-progress", false); return; }
+      let num = mobile.value.trim(), code = otp.value.trim();
+      if (!num.startsWith("+880") && /^\d{11}$/.test(num)) {
+        num = `+880${num.slice(2)}`;
+      }
+      console.log(`Mobile: ${num}, OTP: ${code}`);
+      if (!/^\+?\d{10,12}$/.test(num) || !/^\d{6}$/.test(code)) { toast("Mobile/OTP required", false); return; }
       otpFlight = true;
-      try{
-        const res = await postFormMulti("loginOtp", { mobile_no:num, otp:code }, false, false);
-        if(res?.ok){
-          bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
+      setStatus("Verifying OTP...");
+      try {
+        const res = await postForm(URLS.loginOtp, { mobile_no: num, otp_code: code });
+        if (res.ok) {
+          bearerToken = res.data?.access_token || res.data?.token || "";
+          kv.write("bearerToken", bearerToken);
           toast("OTP verified! Token saved ✓");
-        } else toast(res?.msg || "OTP failed", false);
-      } finally { otpFlight=false; }
+        } else toast(res.msg || "OTP failed", false);
+      } finally { otpFlight = false; }
+    }
+
+    function handleResponse(res) {
+      if (res.msg.includes("403") || res.msg.includes("419")) {
+        toast("CAPTCHA required. Complete it in the browser first and paste token.", false);
+        window.open(URLS.mobileVerify, "_blank");
+      } else {
+        res.ok ? toast("Verification sent") : toast(res.msg || "Failed", false);
+      }
     }
 
     return box;
@@ -352,49 +365,55 @@
 
     const note = input("Ready for BGD form submission"); note.disabled = true;
     const tokenInp = tokenInput(); tokenInp.value = bearerToken;
-    tokenInp.oninput = ()=>{ bearerToken = tokenInp.value.trim(); kv.write("bearerToken", bearerToken); };
+    tokenInp.oninput = () => { bearerToken = tokenInp.value.trim(); kv.write("bearerToken", bearerToken); };
 
-    const rowA = row( button("APPLICATION","b-blue", submitApplication),
-                      button("PERSONAL","b-green", submitPersonal) );
-    const rowB = row( button("OVERVIEW","b-purple", submitOverview),
-                      button("SEND OTP","b-orange", ()=>sendPayOtp(false)) );
-
+    const rowA = row(
+      button("APPLICATION", "b-blue", submitApplication),
+      button("PERSONAL", "b-green", submitPersonal)
+    );
+    const rowB = row(
+      button("OVERVIEW", "b-purple", submitOverview),
+      button("SEND OTP", "b-orange", () => sendPayOtp(false))
+    );
     const otpInp = input("Enter 6-digit Payment OTP");
-    const rowC = row( button("RESEND OTP","b-blue", ()=>sendPayOtp(true)),
-                      button("AUTO","b-orange", ()=>sendPayOtp(true)) );
-    const rowD = row( button("VERIFY OTP","b-purple", verifyPayOtp),
-                      button("AUTO","b-orange", verifyPayOtp) );
-
-    const editBtn = button("ADD/EDIT DATA","b-purple", openDataModal);
-    const stopBtn = button("STOP ALL","b-red", stopAll);
+    const rowC = row(
+      button("RESEND OTP", "b-blue", () => sendPayOtp(true)),
+      button("AUTO", "b-orange", () => sendPayOtp(true))
+    );
+    const rowD = row(
+      button("VERIFY OTP", "b-purple", verifyPayOtp),
+      button("AUTO", "b-orange", verifyPayOtp)
+    );
+    const editBtn = button("ADD/EDIT DATA", "b-purple", openDataModal);
+    const stopBtn = button("STOP ALL", "b-red", stopAll);
 
     box.append(note, tokenInp, rowA, rowB, otpInp, rowC, rowD, editBtn, stopBtn);
 
     async function submitApplication(){
-      const res = await postFormMulti("appSubmit", kv.read("applicationInfo"), false, true);
-      res?.ok ? toast(res.msg || "Application submitted ✓") : toast(res?.msg || "Application failed", false);
+      const res = await postForm(URLS.applicationSubmit, kv.read("applicationInfo"), true);
+      res.ok ? toast(res.msg || "Application submitted ✓") : toast(res.msg || "Application failed", false);
     }
     async function submitPersonal(){
-      const res = await postFormMulti("perSubmit", kv.read("personalInfo"), false, true);
-      res?.ok ? toast(res.msg || "Personal submitted ✓") : toast(res?.msg || "Personal failed", false);
+      const res = await postForm(URLS.personalSubmit, kv.read("personalInfo"), true);
+      res.ok ? toast(res.msg || "Personal submitted ✓") : toast(res.msg || "Personal failed", false);
     }
     async function submitOverview(){
-      const res = await postFormMulti("overview", {}, false, true);
-      res?.ok ? toast(res.msg || "Overview submitted ✓") : toast(res?.msg || "Overview failed", false);
+      const res = await postForm(URLS.overviewSubmit, {}, true);
+      res.ok ? toast(res.msg || "Overview submitted ✓") : toast(res.msg || "Overview failed", false);
     }
     async function sendPayOtp(resend=false){
-      const res = await postFormMulti("payOtpSend", { resend: resend?1:0 }, false, true);
-      res?.ok ? toast("Payment OTP sent") : toast(res?.msg || "OTP send failed", false);
+      const res = await postForm(URLS.payOtpSend, { resend: resend ? 1 : 0 }, true);
+      res.ok ? toast("Payment OTP sent") : toast(res.msg || "OTP send failed", false);
     }
     async function verifyPayOtp(){
-      if(otpFlight){ toast("OTP verify in-progress", false); return; }
+      if (otpFlight) { toast("OTP verify in-progress", false); return; }
       const code = otpInp.value.trim();
-      if(!/^\d{6}$/.test(code)){ toast("Valid 6-digit OTP required", false); return; }
+      if (!/^\d{6}$/.test(code)) { toast("Valid 6-digit OTP required", false); return; }
       otpFlight = true;
-      try{
-        const res = await postFormMulti("payOtpVerify", { otp: code }, false, true);
-        res?.ok ? toast("Payment OTP verified ✓") : toast(res?.msg || "OTP verify failed", false);
-      } finally { otpFlight=false; }
+      try {
+        const res = await postForm(URLS.payOtpVerify, { otp: code }, true);
+        res.ok ? toast("Payment OTP verified ✓") : toast(res.msg || "OTP verify failed", false);
+      } finally { otpFlight = false; }
     }
 
     return box;
@@ -404,43 +423,48 @@
     const box = document.createElement("div"); box.style.display="none";
 
     const note = input("Ready for payment"); note.disabled = true;
-    const date = input("mm/dd/yyyy","date");
-    const rowA = row( button("GET SLOTS","b-blue", getSlots),
-                      button("AUTO","b-orange", getSlots) );
-    const rowB = row( button("PAY NOW","b-purple", payNow),
-                      button("AUTO","b-orange", payNow) );
-    const stopBtn = button("STOP ALL","b-red", stopAll);
+    const date = input("mm/dd/yyyy", "date");
+    const rowA = row(
+      button("GET SLOTS", "b-blue", getSlots),
+      button("AUTO", "b-orange", getSlots)
+    );
+    const rowB = row(
+      button("PAY NOW", "b-purple", payNow),
+      button("AUTO", "b-orange", payNow)
+    );
+    const stopBtn = button("STOP ALL", "b-red", stopAll);
 
     box.append(note, date, rowA, rowB, stopBtn);
 
     async function getSlots(){
-      const d = date.value; if(!d){ toast("Select date", false); return; }
-      const res = await postFormMulti("slotTime", { appointment_date: d }, false, true);
-      if(res?.ok){
+      const d = date.value; if (!d) { toast("Select date", false); return; }
+      const res = await postForm(URLS.slotTime, { appointment_date: d }, true);
+      if (res.ok) {
         const times = res.data?.slot_times || [];
-        toast(times.length? `Slots: ${times.join(", ")}` : "No slots", !!times.length);
-        kv.write("lastSlots", {date:d, times});
-      } else toast(res?.msg || "Slot fetch failed", false);
+        toast(times.length ? `Slots: ${times.join(", ")}` : "No slots", !!times.length);
+        kv.write("lastSlots", { date: d, times });
+      } else toast(res.msg || "Slot fetch failed", false);
     }
+
     async function payNow(){
-      const d = date.value; if(!d){ toast("Select date", false); return; }
+      const d = date.value; if (!d) { toast("Select date", false); return; }
       const pick = (kv.read("lastSlots")?.times || [])[0] || "09:00 - 09:59";
       const payload = {
         appointment_date: d,
         appointment_time: pick,
-        selected_payment: { name:"VISA", slug:"visacard", link:"https://securepay.sslcommerz.com/gwprocess/v4/image/gw1/visa.png" }
+        selected_payment: { name: "VISA", slug: "visacard", link: "https://securepay.sslcommerz.com/gwprocess/v4/image/gw1/visa.png" }
       };
-      const res = await postFormMulti("payNow", payload, false, true);
-      if(res?.ok){
-        const url = res.data?.data?.url; if(url) window.open(url, "_blank");
+      const res = await postForm(URLS.payNow, payload, true);
+      if (res.ok) {
+        const url = res.data?.data?.url; if (url) window.open(url, "_blank");
         toast("Payment init ✓");
-      } else toast(res?.msg || "Pay failed", false);
+      } else toast(res.msg || "Pay failed", false);
     }
 
     return box;
   }
 
-  /************** MODAL **************/
+  /************** DATA MODAL (Add/Edit) **************/
   function openDataModal(){
     const modal = document.createElement("div"); modal.className="alx-modal";
     const card = document.createElement("div"); card.className="alx-modal-card"; modal.appendChild(card);
@@ -448,55 +472,55 @@
     const x = document.createElement("div"); x.className="alx-x"; x.textContent="✕"; card.appendChild(x); x.onclick=()=>modal.remove();
 
     const fields = [
-      ["highcom","Application Info → highcom"],
-      ["webfile_id","Application Info → webfile_id"],
-      ["ivac_id","Application Info → ivac_id"],
-      ["visa_type","Application Info → visa_type"],
-      ["family_count","Application Info → family_count"],
-      ["visit_purpose","Application Info → visit_purpose"],
-      ["full_name","Personal → full_name"],
-      ["email_name","Personal → email"],
-      ["phone","Personal → phone"],
+      ["highcom", "Application Info → highcom"],
+      ["webfile_id", "Application Info → webfile_id"],
+      ["ivac_id", "Application Info → ivac_id"],
+      ["visa_type", "Application Info → visa_type"],
+      ["family_count", "Application Info → family_count"],
+      ["visit_purpose", "Application Info → visit_purpose"],
+      ["full_name", "Personal → full_name"],
+      ["email_name", "Personal → email"],
+      ["phone", "Personal → phone"],
     ];
     const inputs = {};
-    fields.forEach(([k,lab])=>{
-      const i = document.createElement("input"); i.className="alx-input"; i.placeholder=lab; i.value = kv.read("data."+k,"");
-      inputs[k]=i; card.appendChild(i);
+    fields.forEach(([k, lab]) => {
+      const i = document.createElement("input"); i.className="alx-input"; i.placeholder=lab; i.value = kv.read("data."+k, "");
+      inputs[k] = i; card.appendChild(i);
     });
 
-    const save = button("Save Data","b-green",()=>{
-      const data = {}; Object.keys(inputs).forEach(k=> data[k]=inputs[k].value.trim());
+    const save = button("Save Data", "b-green", () => {
+      const data = {};
+      Object.keys(inputs).forEach(k => data[k] = inputs[k].value.trim());
       const app = {
-        highcom: data.highcom||"1",
-        webfile_id: data.webfile_id||"",
-        webfile_id_repeat: data.webfile_id||"",
-        ivac_id: data.ivac_id||"",
-        visa_type: data.visa_type||"",
-        family_count: data.family_count||"0",
-        visit_purpose: data.visit_purpose||""
+        highcom: data.highcom || "1",
+        webfile_id: data.webfile_id || "",
+        webfile_id_repeat: data.webfile_id || "",
+        ivac_id: data.ivac_id || "",
+        visa_type: data.visa_type || "",
+        family_count: data.family_count || "0",
+        visit_purpose: data.visit_purpose || ""
       };
       const per = {
-        full_name: data.full_name||"",
-        email_name: data.email_name||"",
-        phone: data.phone||"",
-        webfile_id: data.webfile_id||""
+        full_name: data.full_name || "",
+        email_name: data.email_name || "",
+        phone: data.phone || "",
+        webfile_id: data.webfile_id || ""
       };
       kv.write("applicationInfo", app);
       kv.write("personalInfo", per);
-      toast("Saved ✓"); modal.remove();
+      toast("Saved ✓");
+      modal.remove();
     });
-    card.appendChild(save); document.body.appendChild(modal);
+    card.appendChild(save);
+    document.body.appendChild(modal);
   }
 
-  /************** STOP **************/
-  function stopCurrent(){ const last = Array.from(active.values()).pop(); if (last){ last.abort(); toast("Stopped current"); } }
-  function stopAll(){ active.forEach(ac=>ac.abort()); active.clear(); toast("Stopped all"); }
-
   /************** ENTRY **************/
-  (function init(){
-    injectCSS(); injectUI(); startTurnstileWatcher();
-    window.addEventListener("keydown", (e)=>{ if(e.altKey && (e.key==="d"||e.key==="D")) openDataModal(); });
-    window.__IVAC__ = { openDataModal, stopAll, focusTurnstileWidget };
-  })();
+  buildUI();
 
+  window.addEventListener("keydown", (e) => {
+    if (e.altKey && (e.key === "d" || e.key === "D")) { openDataModal(); }
+  });
+
+  window.__IVAC__ = { openDataModal, stopAll };
 })();
