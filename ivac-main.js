@@ -1,71 +1,70 @@
-/* ivac-main.js — ALLEX IVAC Automation (Hosted Main)
- * UI: Login | BGD & OTP | Payment  — floating, draggable
+/* ivac-main.js — ALLEX IVAC Automation (Merged Final)
+ * UI: Login | BGD & OTP | Payment — floating, draggable
  * Flows: mobile-verify → login/password or login-otp → token save
  *        application-info-submit → personal-info-submit → overview-submit
  *        pay-otp-sent → pay-otp-verify → pay-slot-time → pay-now
- * Safety: request dedupe, single-flight for OTP, per-origin backoff, abort-all
- * Note: No captcha solver. No CF/Turnstile bypass. If challenge shown, user completes it manually then retry.
+ * Safety: CORS-safe same-origin endpoints, form-POST (no preflight),
+ *         per-origin backoff, single-flight OTP, request de-dupe, STOP ALL
+ * Hotkeys: Alt + D → Add/Edit Data modal
  */
 
 (() => {
   'use strict';
 
-  /************** CONFIG **************/
-  const API = {
-    base: "https://api-payment.ivacbd.com",
-    v2: "/api/v2",
-    payment: "/payment",
-    auth: "/auth",
-  };
+  /************** SAME-ORIGIN ENDPOINTS (CORS-SAFE) **************/
+  const ORIGIN = window.location.origin; // https://payment.ivacbd.com
 
   const URLS = {
     // Auth
-    mobileVerify: `${API.base}${API.v2}${API.payment}/mobile-verify`,
-    login:        `${API.base}${API.v2}${API.payment}/login`,
-    loginOtp:     `${API.base}${API.v2}${API.payment}/login-otp`,
+    mobileVerify:       `${ORIGIN}/api/v2/payment/mobile-verify`,
+    login:              `${ORIGIN}/api/v2/payment/login`,
+    loginOtp:           `${ORIGIN}/api/v2/payment/login-otp`,
 
-    // App flow
-    applicationSubmit: `${API.base}${API.v2}${API.payment}/application-info-submit`,
-    personalSubmit:    `${API.base}${API.v2}${API.payment}/personal-info-submit`,
-    overviewSubmit:    `${API.base}${API.v2}${API.payment}/overview-submit`,
-    checkout:          `${API.base}${API.v2}${API.payment}/checkout`,
+    // Application
+    applicationSubmit:  `${ORIGIN}/api/v2/payment/application-info-submit`,
+    personalSubmit:     `${ORIGIN}/api/v2/payment/personal-info-submit`,
+    overviewSubmit:     `${ORIGIN}/api/v2/payment/overview-submit`,
+    checkout:           `${ORIGIN}/api/v2/payment/checkout`,
 
-    // OTP + Payment
-    payOtpSend:  `${API.base}${API.v2}${API.payment}/pay-otp-sent`,
-    payOtpVerify:`${API.base}${API.v2}${API.payment}/pay-otp-verify`,
-    slotTime:    `${API.base}${API.v2}${API.payment}/pay-slot-time`,
-    payNow:      `${API.base}${API.v2}${API.payment}/pay-now`,
+    // Payment + OTP
+    payOtpSend:         `${ORIGIN}/api/v2/payment/pay-otp-sent`,
+    payOtpVerify:       `${ORIGIN}/api/v2/payment/pay-otp-verify`,
+    slotTime:           `${ORIGIN}/api/v2/payment/pay-slot-time`,
+    payNow:             `${ORIGIN}/api/v2/payment/pay-now`
   };
 
   const UI_TXT = {
     title: "Allex@cyber2",
-    v: "v3.3 | ALLEX | Updated",
+    v: "v3.3 | ALLEX | Updated"
   };
 
   /************** STATE **************/
   const kv = {
     get k(){ return JSON.parse(localStorage.getItem("ivac_kv") || "{}"); },
     set k(v){ localStorage.setItem("ivac_kv", JSON.stringify(v || {})); },
-    read(key, def=null){ return (this.k[key] ?? def); },
+    read(path, def=null){
+      if(!path.includes(".")) return (this.k[path] ?? def);
+      const seg = path.split("."); let t = this.k;
+      for(const s of seg){ if(t == null) return def; t = t[s]; }
+      return (t ?? def);
+    },
     write(key, val){ const x=this.k; x[key]=val; this.k=x; },
     remove(key){ const x=this.k; delete x[key]; this.k=x; },
   };
 
-  let bearerToken = kv.read("bearerToken",""); // saved after login/otp
-  let active = new Map();                      // id -> AbortController
-  let dedupe = new Set();                      // signature set
-  const backoffMap = new Map();                // origin -> {fail, until}
-  let otpFlight = false;                       // single-flight lock for OTP verify
+  let bearerToken = kv.read("bearerToken","");     // saved after login/otp
+  let active = new Map();                          // id -> AbortController
+  let dedupe = new Set();                          // short signature set
+  const backoffMap = new Map();                    // origin -> {fail, until}
+  let otpFlight = false;                           // OTP single-flight
 
   function makeSig(url, method, body){ return `${method}:${url}:${body?JSON.stringify(body).slice(0,200):""}`; }
   function originOf(url){ try{ return new URL(url).origin; }catch{ return "default"; } }
-
   function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   function now(){ return Date.now(); }
 
   async function backoffGuard(url){
-    const o = originOf(url);
-    const ent = backoffMap.get(o);
+    const o = originOf(url); const ent = backoffMap.get(o);
     if (ent && ent.until && ent.until > now()){
       const wait = ent.until - now();
       setStatus(`Backoff ${Math.ceil(wait/1000)}s…`, "#c77d00");
@@ -73,17 +72,12 @@
     }
   }
   function noteFailure(url){
-    const o = originOf(url);
-    const ent = backoffMap.get(o) || {fail:0, until:0};
+    const o = originOf(url); const ent = backoffMap.get(o) || {fail:0, until:0};
     ent.fail = Math.min(ent.fail+1, 6);
-    const wait = Math.floor((2 ** ent.fail) * 400 + Math.random()*300); // expo+jitter
-    ent.until = now() + wait;
-    backoffMap.set(o, ent);
+    const wait = Math.floor((2 ** ent.fail) * 400 + Math.random()*300); // expo + jitter
+    ent.until = now() + wait; backoffMap.set(o, ent);
   }
-  function noteSuccess(url){
-    const o = originOf(url);
-    backoffMap.set(o, {fail:0, until:0});
-  }
+  function noteSuccess(url){ const o=originOf(url); backoffMap.set(o, {fail:0, until:0}); }
 
   /************** UI **************/
   const css = `
@@ -107,7 +101,7 @@
   .alx-footer{padding:8px 14px;color:#6b7280;font-size:12px;border-top:1px solid #eee;text-align:center}
   .alx-toast{position:fixed;left:20px;bottom:20px;background:#111;color:#fff;padding:12px 16px;border-radius:10px;box-shadow:0 8px 20px rgba(0,0,0,.25);z-index:100000}
   .alx-modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100000}
-  .alx-modal-card{width:520px;background:#fff;border-radius:12px;padding:16px;border:1px solid #e5e7eb}
+  .alx-modal-card{width:520px;background:#fff;border-radius:12px;padding:16px;border:1px solid #e5e7eb;position:relative}
   .alx-modal-title{font-weight:800;margin-bottom:10px}
   .alx-x{position:absolute;top:10px;right:14px;cursor:pointer;font-weight:800}
   `;
@@ -135,7 +129,7 @@
     });
   }
 
-  // Build UI
+  // build UI
   function buildUI(){
     injectCSS();
     const root = document.createElement("div"); root.className="alx-root";
@@ -170,17 +164,78 @@
     }
   }
 
-  // Views
+  // inputs / rows / buttons
+  function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
+  function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
+  function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
+  function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
+
+  /************** FORM-POST helper (NO PREFLIGHT) **************/
+  async function postForm(url, dataObj, includeAuth=false){
+    await backoffGuard(url);
+
+    const body = new URLSearchParams();
+    Object.entries(dataObj || {}).forEach(([k,v]) => body.append(k, v ?? ""));
+
+    const headers = { "accept": "application/json" };
+    if (includeAuth && bearerToken) headers["authorization"] = `Bearer ${bearerToken}`;
+
+    // de-dupe
+    const sig = makeSig(url, "POST", dataObj);
+    if (dedupe.has(sig)) return {ok:false, msg:"Duplicate request suppressed"};
+    dedupe.add(sig); setTimeout(()=>dedupe.delete(sig), 800);
+
+    const ac = new AbortController(); const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
+
+    try{
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body,
+        credentials: "include",
+        redirect: "manual",
+        signal: ac.signal
+      });
+      active.delete(id);
+
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        setStatus("Redirect detected → অন্য origin? Same-origin রাখো.", "#b45309");
+        return {ok:false, msg:"redirect"};
+      }
+      if ([403,419,429,503].includes(res.status)) {
+        noteFailure(url);
+        if (res.status===429) setStatus("Rate limited. Retrying later…", "#b45309");
+        if (res.status===403 || res.status===419) setStatus("CF/Session challenge — পেজে যা চাইছে আগে সেটি কমপ্লিট করে আবার চেষ্টা করুন.", "#b91c1c");
+        return {ok:false, msg:`HTTP ${res.status}`};
+      }
+      if (!res.ok) { noteFailure(url); return {ok:false, msg:`HTTP ${res.status}`}; }
+
+      noteSuccess(url);
+      const data = await res.json().catch(()=> ({}));
+      return {ok:true, data, msg: data?.message || data?.msg || "OK"};
+    }catch(e){
+      active.delete(id); noteFailure(url);
+      return {ok:false, msg:e.message || "Network/CORS"};
+    }
+  }
+
+  function stopCurrent(){
+    const last = Array.from(active.values()).pop();
+    if (last){ last.abort(); toast("Stopped current"); }
+  }
+  function stopAll(){ active.forEach(ac=>ac.abort()); active.clear(); toast("Stopped all"); }
+
+  /************** VIEWS **************/
   function loginView(){
     const box = document.createElement("div");
 
+    const ready = input("Ready"); ready.disabled = true;
     const mobile = input("Enter mobile number (11 digits)");
     const pass = input("Enter password","password");
     const otp = input("Enter 6-digit OTP");
-    const copyBtn = button("COPY ACCESS TOKEN","b-purple",()=>{ navigator.clipboard.writeText(bearerToken||""); toast("Access token copied"); });
 
     const row1 = row( button("SEND VERIFICATION","b-green", onMobileVerify),
-                      button("AUTO","b-orange", onLoginAuto) );
+                      button("AUTO","b-orange", ()=>setStatus("Auto login…")) );
 
     const row2 = row( button("LOGIN WITH PASSWORD","b-blue", onLoginWithPassword),
                       button("AUTO","b-orange", onLoginWithPassword) );
@@ -188,26 +243,29 @@
     const row3 = row( button("LOGIN WITH OTP","b-purple", onLoginWithOtp),
                       button("AUTO","b-orange", onLoginWithOtp) );
 
+    const copyBtn = button("COPY ACCESS TOKEN","b-purple",()=>{
+      navigator.clipboard.writeText(bearerToken||""); toast("Access token copied");
+    });
+
     const rowStop = row( button("STOP CURRENT","b-red", stopCurrent),
                          button("STOP ALL","b-red", stopAll) );
 
-    box.append( mobile, row1, pass, row2, otp, row3, copyBtn, rowStop );
+    box.append(ready, mobile, row1, pass, row2, otp, row3, copyBtn, rowStop);
 
-    function onLoginAuto(){ setStatus("Auto login sequence…"); }
     async function onMobileVerify(){
       const num = mobile.value.trim();
       if(!/^\d{11}$/.test(num)){ toast("Invalid mobile number", false); return; }
-      const res = await request(URLS.mobileVerify, "POST", {mobile: num});
+      const res = await postForm(URLS.mobileVerify, { mobile: num });
       res.ok ? toast("Verification sent") : toast(res.msg || "Failed", false);
     }
     async function onLoginWithPassword(){
       const num=mobile.value.trim(), pw=pass.value;
       if(!/^\d{11}$/.test(num) || !pw){ toast("Mobile/password required", false); return; }
-      const res = await request(URLS.login, "POST", {mobile:num, password:pw});
+      const res = await postForm(URLS.login, { mobile:num, password:pw });
       if(res.ok){
         bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
         toast("Logged in (password) ✓");
-      }else toast(res.msg || "Login failed", false);
+      } else toast(res.msg || "Login failed", false);
     }
     async function onLoginWithOtp(){
       if(otpFlight){ toast("OTP verify in-progress", false); return; }
@@ -215,11 +273,11 @@
       if(!/^\d{11}$/.test(num) || !/^\d{6}$/.test(code)){ toast("Mobile/OTP required", false); return; }
       otpFlight = true;
       try{
-        const res = await request(URLS.loginOtp, "POST", {mobile:num, otp:code});
+        const res = await postForm(URLS.loginOtp, { mobile:num, otp:code });
         if(res.ok){
           bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
           toast("OTP verified! Token saved ✓");
-        }else toast(res.msg || "OTP failed", false);
+        } else toast(res.msg || "OTP failed", false);
       } finally { otpFlight=false; }
     }
 
@@ -228,12 +286,15 @@
 
   function bgdView(){
     const box = document.createElement("div"); box.style.display="none";
-    const tokenInp = tokenInput(); tokenInp.value = bearerToken; tokenInp.oninput = ()=>{ bearerToken = tokenInp.value.trim(); kv.write("bearerToken", bearerToken); };
+
+    const note = input("Ready for BGD form submission"); note.disabled = true;
+    const tokenInp = tokenInput(); tokenInp.value = bearerToken;
+    tokenInp.oninput = ()=>{ bearerToken = tokenInp.value.trim(); kv.write("bearerToken", bearerToken); };
 
     const rowA = row( button("APPLICATION","b-blue", submitApplication),
                       button("PERSONAL","b-green", submitPersonal) );
     const rowB = row( button("OVERVIEW","b-purple", submitOverview),
-                      button("SEND OTP","b-orange", sendPayOtp) );
+                      button("SEND OTP","b-orange", ()=>sendPayOtp(false)) );
 
     const otpInp = input("Enter 6-digit Payment OTP");
     const rowC = row( button("RESEND OTP","b-blue", ()=>sendPayOtp(true)),
@@ -241,34 +302,34 @@
     const rowD = row( button("VERIFY OTP","b-purple", verifyPayOtp),
                       button("AUTO","b-orange", verifyPayOtp) );
 
-    const rowStop = row( button("STOP ALL","b-red", stopAll) );
+    const editBtn = button("ADD/EDIT DATA","b-purple", openDataModal);
+    const stopBtn = button("STOP ALL","b-red", stopAll);
 
-    box.append( statusEl?document.createTextNode(""):document.createTextNode(""), tokenInp, rowA, rowB, otpInp, rowC, rowD, rowStop );
+    box.append(note, tokenInp, rowA, rowB, otpInp, rowC, rowD, editBtn, stopBtn);
 
     async function submitApplication(){
-      const res = await authed(URLS.applicationSubmit, "POST", kv.read("applicationInfo"));
+      const res = await postForm(URLS.applicationSubmit, kv.read("applicationInfo"), true);
       res.ok ? toast(res.msg || "Application submitted ✓") : toast(res.msg || "Application failed", false);
     }
     async function submitPersonal(){
-      const res = await authed(URLS.personalSubmit, "POST", kv.read("personalInfo"));
+      const res = await postForm(URLS.personalSubmit, kv.read("personalInfo"), true);
       res.ok ? toast(res.msg || "Personal submitted ✓") : toast(res.msg || "Personal failed", false);
     }
     async function submitOverview(){
-      const res = await authed(URLS.overviewSubmit, "POST", null);
+      const res = await postForm(URLS.overviewSubmit, {}, true);
       res.ok ? toast(res.msg || "Overview submitted ✓") : toast(res.msg || "Overview failed", false);
     }
     async function sendPayOtp(resend=false){
-      const resq = {resend: resend?1:0};
-      const res = await authed(URLS.payOtpSend, "POST", resq);
+      const res = await postForm(URLS.payOtpSend, { resend: resend?1:0 }, true);
       res.ok ? toast("Payment OTP sent") : toast(res.msg || "OTP send failed", false);
     }
     async function verifyPayOtp(){
       if(otpFlight){ toast("OTP verify in-progress", false); return; }
-      const code = (document.querySelector(".alx-body input[placeholder^='Enter 6-digit Payment OTP']")||{}).value?.trim();
-      if(!/^\d{6}$/.test(code || "")){ toast("Valid 6-digit OTP required", false); return; }
+      const code = otpInp.value.trim();
+      if(!/^\d{6}$/.test(code)){ toast("Valid 6-digit OTP required", false); return; }
       otpFlight = true;
       try{
-        const res = await authed(URLS.payOtpVerify, "POST", {otp: code});
+        const res = await postForm(URLS.payOtpVerify, { otp: code }, true);
         res.ok ? toast("Payment OTP verified ✓") : toast(res.msg || "OTP verify failed", false);
       } finally { otpFlight=false; }
     }
@@ -278,17 +339,20 @@
 
   function payView(){
     const box = document.createElement("div"); box.style.display="none";
+
+    const note = input("Ready for payment"); note.disabled = true;
     const date = input("mm/dd/yyyy","date");
     const rowA = row( button("GET SLOTS","b-blue", getSlots),
                       button("AUTO","b-orange", getSlots) );
     const rowB = row( button("PAY NOW","b-purple", payNow),
                       button("AUTO","b-orange", payNow) );
-    const rowStop = row( button("STOP ALL","b-red", stopAll) );
-    box.append( date, rowA, rowB, rowStop );
+    const stopBtn = button("STOP ALL","b-red", stopAll);
+
+    box.append(note, date, rowA, rowB, stopBtn);
 
     async function getSlots(){
       const d = date.value; if(!d){ toast("Select date", false); return; }
-      const res = await authed(URLS.slotTime, "POST", {appointment_date: d});
+      const res = await postForm(URLS.slotTime, { appointment_date: d }, true);
       if(res.ok){
         const times = res.data?.slot_times || [];
         toast(times.length? `Slots: ${times.join(", ")}` : "No slots", !!times.length);
@@ -304,21 +368,17 @@
         appointment_time: pick,
         selected_payment: { name:"VISA", slug:"visacard", link:"https://securepay.sslcommerz.com/gwprocess/v4/image/gw1/visa.png" }
       };
-      const res = await authed(URLS.payNow, "POST", payload);
+      const res = await postForm(URLS.payNow, payload, true);
       if(res.ok){
         const url = res.data?.data?.url; if(url) window.open(url, "_blank");
         toast("Payment init ✓");
       } else toast(res.msg || "Pay failed", false);
     }
+
     return box;
   }
 
-  function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
-  function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
-  function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
-  function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
-
-  // Add/Edit Data modal (simple)
+  /************** DATA MODAL (Add/Edit) **************/
   function openDataModal(){
     const modal = document.createElement("div"); modal.className="alx-modal";
     const card = document.createElement("div"); card.className="alx-modal-card"; modal.appendChild(card);
@@ -345,7 +405,6 @@
     const save = button("Save Data","b-green",()=>{
       const data = {};
       Object.keys(inputs).forEach(k=> data[k]=inputs[k].value.trim());
-      // Map to payload shapes
       const app = {
         highcom: data.highcom||"1",
         webfile_id: data.webfile_id||"",
@@ -367,89 +426,18 @@
       modal.remove();
     });
     card.appendChild(save);
-
     document.body.appendChild(modal);
-  }
-
-  /************** ROUTER **************/
-  async function request(url, method="GET", body=null, auth=false){
-    await backoffGuard(url);
-
-    const sig = makeSig(url, method, body);
-    if(dedupe.has(sig)){ return {ok:false, msg:"Duplicate request suppressed"}; }
-    dedupe.add(sig); setTimeout(()=>dedupe.delete(sig), 800); // short de-dupe window
-
-    const ac = new AbortController(); const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
-
-    const headers = {
-      "accept": "application/json",
-      "content-type": "application/json",
-      "language": "en"
-    };
-    if(auth && bearerToken){ headers["authorization"] = `Bearer ${bearerToken}`; }
-
-    const opts = {
-      method, headers, signal: ac.signal,
-      credentials: "include",
-      mode: "cors",
-      referrerPolicy: "strict-origin-when-cross-origin"
-    };
-    if(body) opts.body = JSON.stringify(body);
-
-    try{
-      const res = await fetch(url, opts);
-      active.delete(id);
-
-      // CF/Rate-limit awareness (no bypass)
-      if([403, 409, 419, 429, 503].includes(res.status)){
-        noteFailure(url);
-        if(res.status===429) setStatus("Rate limited. Retrying later…","#b45309");
-        if(res.status===403 || res.status===503) setStatus("Challenge or server busy. Complete challenge/refresh then retry.", "#b91c1c");
-        return {ok:false, status:res.status, msg:`HTTP ${res.status}`};
-      }
-      if(!res.ok){
-        noteFailure(url);
-        const txt = await res.text().catch(()=> "");
-        return {ok:false, status:res.status, msg:txt||`HTTP ${res.status}`};
-      }
-
-      noteSuccess(url);
-      const data = await res.json().catch(()=> ({}));
-      const msg = data?.message || data?.msg || "OK";
-      return {ok:true, data, msg};
-
-    }catch(e){
-      active.delete(id); noteFailure(url);
-      return {ok:false, msg:e.message||"Network error"};
-    }
-  }
-
-  function stopCurrent(){
-    // Abort last controller if any (best-effort)
-    const last = Array.from(active.values()).pop();
-    if(last){ last.abort(); toast("Stopped current"); }
-  }
-  function stopAll(){
-    active.forEach(ac=>ac.abort()); active.clear(); toast("Stopped all");
-  }
-
-  async function authed(url, method, body){
-    if(!bearerToken){ toast("Bearer token missing", false); return {ok:false, msg:"No token"}; }
-    return request(url, method, body, true);
   }
 
   /************** ENTRY **************/
   buildUI();
 
-  // global keyboard: Alt+D to open data modal
+  // keyboard shortcut
   window.addEventListener("keydown", (e)=>{
     if(e.altKey && (e.key==="d" || e.key==="D")){ openDataModal(); }
   });
 
-  // Quick action entry points if you want to trigger from console
-  window.__IVAC__ = {
-    openDataModal,
-    stopAll
-  };
+  // quick hooks
+  window.__IVAC__ = { openDataModal, stopAll };
 
 })();
