@@ -38,7 +38,7 @@
   };
 
   const UI_TXT = {
-    title: "Sabbir Rahman",
+    title: "Allex@cyber2",
     v: "v3.3 | ALLEX | Updated",
   };
 
