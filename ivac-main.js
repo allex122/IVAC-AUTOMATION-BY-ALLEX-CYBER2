@@ -1,11 +1,12 @@
-/* ivac-main.js — ALLEX IVAC Automation (Final, UI fixed + native mobile-verify)
- * - Floating panel (draggable) now reliably renders (injectUI -> append to body)
- * - mobile-verify uses **site's native form submit** (keeps hidden/CSRF/turnstile)
- * - Turnstile token is used only if user solved it (no solver/bypass here)
- * - Same-origin URL-encoded form POST + credentials:include
+/* ivac-main.js — ALLEX IVAC Automation (final merged)
+ * - Floating panel (draggable), ALLEX branding
+ * - mobile-verify: native submit (no <form>? then fill input + auto-click Proceed)
+ * - Turnstile token auto-capture (captcha_token / cf-turnstile-response)
+ * - Same-origin URL-encoded form POST + credentials: include
  * - Fallback router: /api/v2/payment → /api/payment → /api/v2
- * - OTP single-flight, de-dupe, STOP CURRENT/ALL
  * - Tabs: Login | BGD & OTP | Payment
+ * - OTP single-flight, STOP CURRENT/ALL, request de-dupe
+ * - Hotkey: Alt + D → Data modal
  */
 
 (() => {
@@ -16,7 +17,7 @@
   const ROUTE_BASES = [
     `${ORIGIN}/api/v2/payment`,
     `${ORIGIN}/api/payment`,
-    `${ORIGIN}/api/v2`
+    `${ORIGIN}/api/v2`,
   ];
   const EP = (base) => ({
     mobileVerify:  `${base}/mobile-verify`,
@@ -33,7 +34,7 @@
   });
 
   /************** UI CONST **************/
-  const UI_TXT = { title: "Allex@cyber2", v: "v3.3 | ALLEX | Updated" };
+  const BRAND = { title: "ALLEX", ver: "v4.0" };
   const TS_KEY = "ivac_turnstile_token";
 
   /************** STATE **************/
@@ -50,15 +51,16 @@
   };
   let bearerToken = kv.read("bearerToken",""); // saved after login/otp
   const active = new Map();                    // id -> AbortController
-  const dedupe = new Set();                    // simple request de-dupe
+  const dedupe = new Set();                    // request de-dupe
   const backoff = new Map();                   // origin -> {fail, until}
   let otpFlight = false;
+  let statusEl;
 
   /************** UTIL **************/
   const css = `
   .alx-root{position:fixed;right:20px;top:20px;z-index:999999;font-family:Inter,Segoe UI,Roboto,system-ui,sans-serif}
   .alx-card{width:420px;background:#fff;border-radius:14px;border:2px solid #0b285a;box-shadow:0 10px 30px rgba(0,0,0,.15);overflow:hidden}
-  .alx-head{padding:10px 14px;background:linear-gradient(135deg,#0b285a,#123c85);color:#fff;font-weight:700;text-align:center;cursor:move;user-select:none}
+  .alx-head{padding:10px 14px;background:linear-gradient(135deg,#0b285a,#123c85);color:#fff;font-weight:800;text-align:center;cursor:move;user-select:none}
   .alx-tabs{display:flex;border-bottom:1px solid #eee}
   .alx-tab{flex:1;text-align:center;padding:10px;cursor:pointer;font-weight:600;color:#6b7280;border-bottom:3px solid transparent}
   .alx-tab.active{color:#2563eb;border-color:#2563eb}
@@ -87,11 +89,8 @@
   async function backoffGuard(url){ const ent=backoffInfo(url); if(ent.until>now()) await sleep(ent.until-now()); }
   function noteFail(url){ const o=new URL(url).origin; const e=backoff.get(o)||{fail:0,until:0}; e.fail=Math.min(e.fail+1,6); e.until=now()+Math.floor((2**e.fail)*400+Math.random()*300); backoff.set(o,e); }
   function noteOk(url){ const o=new URL(url).origin; backoff.set(o,{fail:0,until:0}); }
-
   function injectCSS(){ if(!document.getElementById("alx-style")){ const st=document.createElement("style"); st.id="alx-style"; st.textContent=css; document.head.appendChild(st); } }
   function toast(msg, ok=true){ const t=document.createElement("div"); t.className="alx-toast"; t.textContent=msg; t.style.background= ok? "linear-gradient(135deg,#059669,#065f46)":"linear-gradient(135deg,#b91c1c,#7f1d1d)"; document.body.appendChild(t); setTimeout(()=>t.remove(),2200); }
-
-  let statusEl;
   function setStatus(msg, color){ if(statusEl){ statusEl.textContent=msg; if(color) statusEl.style.color=color; } }
 
   /************** TURNSTILE (capture on verify) **************/
@@ -113,37 +112,59 @@
     else toast("Turnstile widget not visible here.", false);
   }
 
-  /************** NATIVE mobile-verify (keeps hidden/CSRF) **************/
+  /************** NATIVE mobile-verify (form না থাকলেও কাজ করবে) **************/
   function nativeMobileVerify(number) {
-    let form = document.querySelector('form[action*="mobile-verify" i]');
-    if (!form) {
-      const authBox = document.querySelector('.tab-pane.active') ||
-                      document.querySelector('#authentication, .tab-content') ||
-                      document.body;
-      form = authBox && authBox.querySelector('form');
-    }
-    if (!form) { toast("Auth form not found. Update selector.", false); return false; }
-
+    // 1) mobile_no ইনপুট খুঁজি (multi-fallback)
     const mobileInp =
-      form.querySelector('input[name="mobile_no" i]') ||
-      document.querySelector('input[name="mobile_no" i]');
-    if (mobileInp) {
-      mobileInp.value = number;
-      mobileInp.dispatchEvent(new Event('input',{bubbles:true}));
-      mobileInp.dispatchEvent(new Event('change',{bubbles:true}));
+      document.querySelector('input[name="mobile_no" i]') ||
+      document.querySelector('#mobile_no') ||
+      document.querySelector('input[type="tel"]') ||
+      document.querySelector('input[placeholder*="mobile" i]') ||
+      document.querySelector('input[placeholder*="number" i]');
+
+    if (!mobileInp) { toast("Mobile input not found.", false); return false; }
+
+    // 2) value সেট + input/change ইভেন্ট
+    mobileInp.value = number;
+    mobileInp.dispatchEvent(new Event('input',{bubbles:true}));
+    mobileInp.dispatchEvent(new Event('change',{bubbles:true}));
+
+    // 3) Turnstile token hidden ইনপুটে বসাই (না থাকলে তৈরি করি)
+    const t =
+      localStorage.getItem(TS_KEY) ||
+      (document.querySelector('input[name="captcha_token"]')||{}).value ||
+      (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
+
+    if (t) {
+      let tsInp =
+        document.querySelector('input[name="captcha_token" i]') ||
+        document.querySelector('input[name="cf-turnstile-response" i]');
+      if (!tsInp) {
+        tsInp = document.createElement("input");
+        tsInp.type = "hidden";
+        tsInp.name = "captcha_token";
+        (mobileInp.closest('form') || mobileInp.parentElement || document.body).appendChild(tsInp);
+      }
+      tsInp.value = t;
     }
 
-    const t = localStorage.getItem(TS_KEY) ||
-              (document.querySelector('input[name="captcha_token"]')||{}).value ||
-              (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
-    let tsInp =
-      form.querySelector('input[name="captcha_token" i]') ||
-      form.querySelector('input[name="cf-turnstile-response" i]');
-    if (!tsInp && t) { tsInp=document.createElement('input'); tsInp.type='hidden'; tsInp.name='captcha_token'; form.appendChild(tsInp); }
-    if (tsInp && t) tsInp.value = t;
+    // 4) Submit/Proceed বাটন খুঁজি (form থাকলে requestSubmit; নইলে click)
+    const proceedBtn =
+      (mobileInp.closest('form') && mobileInp.closest('form').querySelector('[type="submit"], button')) ||
+      document.querySelector('#proceed') ||
+      document.querySelector('button[type="submit"]') ||
+      document.querySelector('button.btn-primary') ||
+      document.querySelector('button, input[type="button"], input[type="submit"]');
 
-    if (typeof form.requestSubmit === 'function') form.requestSubmit(); else form.submit();
-    return true;
+    if (proceedBtn) {
+      const form = mobileInp.closest('form');
+      if (form && typeof form.requestSubmit === 'function') form.requestSubmit(proceedBtn);
+      else proceedBtn.click();
+      return true;
+    }
+
+    toast("Proceed button not found.", false);
+    return false;
   }
 
   /************** FETCH (fallback router, form-POST) **************/
@@ -189,8 +210,12 @@
     return lastErr || {ok:false,msg:"no-route"};
   }
 
-  /************** UI BUILD (FIXED: append to body) **************/
-  let statusBox;
+  /************** UI BUILD **************/
+  function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
+  function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
+  function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
+  function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
+
   function injectUI(){
     injectCSS();
 
@@ -203,7 +228,7 @@
 
     const head = document.createElement("div");
     head.className="alx-head";
-    head.textContent = UI_TXT.title;
+    head.textContent = BRAND.title;
     card.appendChild(head);
 
     const tabs = document.createElement("div");
@@ -227,28 +252,18 @@
     const viewLogin = loginView();
     const viewBGD   = bgdView();
     const viewPay   = payView();
-
     body.append(viewLogin, viewBGD, viewPay);
     switchTab(0);
 
     const footer = document.createElement("div");
     footer.className="alx-footer";
-    footer.textContent = `${UI_TXT.v} ${new Date().toISOString().slice(0,10)}`;
+    footer.textContent = `${BRAND.ver} ${new Date().toISOString().slice(0,10)}`;
     card.appendChild(footer);
 
-    // >>> critical: actually render the panel
     document.body.appendChild(root);
-
-    // drag handle
     makeDraggable(root, head);
 
-    function tabEl(txt){
-      const d=document.createElement("div");
-      d.className="alx-tab";
-      d.textContent=txt;
-      d.onclick=()=>switchTab([tLogin,tBGD,tPay].indexOf(d));
-      return d;
-    }
+    function tabEl(txt){ const d=document.createElement("div"); d.className="alx-tab"; d.textContent=txt; d.onclick=()=>switchTab([tLogin,tBGD,tPay].indexOf(d)); return d; }
     function switchTab(i){
       [tLogin,tBGD,tPay].forEach((t,idx)=> t.classList.toggle("active", idx===i));
       [viewLogin,viewBGD,viewPay].forEach((v,idx)=> v.style.display = idx===i? "block":"none");
@@ -262,11 +277,6 @@
   }
 
   /************** VIEWS **************/
-  function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
-  function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
-  function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
-  function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
-
   function loginView(){
     const box = document.createElement("div");
 
@@ -300,7 +310,7 @@
                     (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
       if (!token){ setStatus("Solve Turnstile first, then try.", "#b45309"); focusTurnstileWidget(); return; }
       const ok = nativeMobileVerify(num);
-      if (ok) { setStatus("Submitting mobile-verify via native form…", "#0ea5e9"); toast("Submitting…"); }
+      if (ok) { setStatus("Submitting mobile-verify…", "#0ea5e9"); toast("Submitting…"); }
     }
     async function onLoginWithPassword(){
       const num=mobile.value.trim(), pw=pass.value;
@@ -409,7 +419,8 @@
       };
       const res = await postFormMulti("payNow", payload, false, true);
       if(res?.ok){
-        const url = res.data?.data?.url; if(url) window.open(url,"_blank");
+        const url = res.data?.data?.url || res.data?.redirect_url || res.data?.payment_url;
+        if (url) window.open(url,"_blank");
         toast("Payment init ✓");
       } else toast(res?.msg || "Pay failed", false);
     }
