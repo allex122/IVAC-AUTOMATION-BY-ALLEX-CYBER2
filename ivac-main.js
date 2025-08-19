@@ -1,8 +1,8 @@
-/* ivac-main.js — ALLEX IVAC Automation (Merged Final)
+/* ivac-main.js — ALLEX IVAC Automation (Merged + Native Mobile Verify)
  * - Same-origin endpoints (https://payment.ivacbd.com)
- * - URL-encoded form POST (no preflight), credentials:include
+ * - URL-encoded form POST (no preflight), credentials: include
  * - Turnstile token auto-capture (captcha_token / cf-turnstile-response)
- * - Attach token where required (mobile-verify), optional attach on others
+ * - **Mobile-verify uses native form submit** (keeps hidden CSRF/refs)
  * - Per-origin backoff, OTP single-flight, request de-dupe
  * - Fallback router: /api/v2/payment → /api/payment → /api/v2
  * - UI: Login | BGD & OTP | Payment + “SOLVE TURNSTILE”
@@ -14,13 +14,11 @@
 
   /************** CONFIG **************/
   const ORIGIN = location.origin; // https://payment.ivacbd.com
-  // Try these bases in order if 404/405:
   const ROUTE_BASES = [
     `${ORIGIN}/api/v2/payment`,
     `${ORIGIN}/api/payment`,
-    `${ORIGIN}/api/v2`
+    `${ORIGIN}/api/v2`,
   ];
-
   const EP = (base) => ({
     mobileVerify:  `${base}/mobile-verify`,
     login:         `${base}/login`,
@@ -44,7 +42,7 @@
     read(path, def=null){
       if(!path.includes(".")) return (this.k[path] ?? def);
       const seg = path.split("."); let t = this.k;
-      for(const s of seg){ if(t == null) return def; t = t[s]; }
+      for (const s of seg){ if(t == null) return def; t = t[s]; }
       return (t ?? def);
     },
     write(key, val){ const x=this.k; x[key]=val; this.k=x; },
@@ -52,7 +50,7 @@
 
   let bearerToken = kv.read("bearerToken","");     // saved after login/otp
   const active = new Map();                        // id -> AbortController
-  const dedupe = new Set();                        // short signature set
+  const dedupe = new Set();                        // signature set
   const backoff = new Map();                       // origin -> {fail, until}
   let otpFlight = false;
 
@@ -150,15 +148,53 @@
     else toast("Turnstile widget not visible here.", false);
   }
 
+  /************** NATIVE MOBILE-VERIFY SUBMIT **************/
+  function nativeMobileVerify(number) {
+    // try to find the exact auth form
+    let form = document.querySelector('form[action*="mobile-verify" i]');
+    if (!form) {
+      const authBox = document.querySelector('.tab-pane.active') ||
+                      document.querySelector('#authentication, .tab-content') ||
+                      document.body;
+      form = authBox && authBox.querySelector('form');
+    }
+    if (!form) { toast("Could not find auth form. Update selector.", false); return false; }
+
+    // set mobile input
+    const mobileInp =
+      form.querySelector('input[name="mobile_no" i]') ||
+      document.querySelector('input[name="mobile_no" i]');
+    if (mobileInp) {
+      mobileInp.value = number;
+      mobileInp.dispatchEvent(new Event('input', {bubbles:true}));
+      mobileInp.dispatchEvent(new Event('change', {bubbles:true}));
+    }
+
+    // attach turnstile token
+    const t = localStorage.getItem(TS_KEY) ||
+              (document.querySelector('input[name="captcha_token"]')||{}).value ||
+              (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
+    let tsInp =
+      form.querySelector('input[name="captcha_token" i]') ||
+      form.querySelector('input[name="cf-turnstile-response" i]');
+    if (!tsInp && t) { tsInp = document.createElement('input'); tsInp.type='hidden'; tsInp.name='captcha_token'; form.appendChild(tsInp); }
+    if (tsInp && t) tsInp.value = t;
+
+    // submit natively
+    if (typeof form.requestSubmit === 'function') form.requestSubmit();
+    else form.submit();
+    return true;
+  }
+
   /************** NETWORK (fallback aware) **************/
   async function postFormMulti(kind, data, needTS=false, includeAuth=false){
-    // attach captcha_token if needed (server expects this exact key on mobile-verify)
     if (needTS) {
-      const t = localStorage.getItem(TS_KEY) || "";
-      if (!t) setStatus("Turnstile token missing. Click 'SOLVE TURNSTILE' and try again.", "#b45309");
-      if (t) data = { ...(data||{}), "captcha_token": t };
-      // keep cf-turnstile-response optionally for future:
-      // if (t) data["cf-turnstile-response"] = t;
+      const t = localStorage.getItem(TS_KEY) ||
+                (document.querySelector('input[name="captcha_token"]')||{}).value ||
+                (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
+      if (!t) { setStatus("Solve Turnstile first, then try.", "#b45309"); return {ok:false, msg:"turnstile-missing"}; }
+      data = { ...(data||{}), "captcha_token": t };
+      // data["cf-turnstile-response"] = t; // optional
     }
 
     const body = new URLSearchParams();
@@ -167,16 +203,13 @@
     const headers = { accept: "application/json" };
     if (includeAuth && bearerToken) headers.authorization = `Bearer ${bearerToken}`;
 
-    // Try each route base until success or non-405/404 error
     let lastErr = null;
     for (const base of ROUTE_BASES) {
-      const urls = EP(base);
-      const url = urls[kind];
+      const url = EP(base)[kind];
       await backoffGuard(url);
 
-      // de-dupe
       const sig = makeSig(url, "POST", data);
-      if (dedupe.has(sig)) return {ok:false, msg:"Duplicate request suppressed"};
+      if (dedupe.has(sig)) return {ok:false, msg:"deduped"};
       dedupe.add(sig); setTimeout(()=>dedupe.delete(sig), 800);
 
       const ac = new AbortController(); const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
@@ -184,36 +217,31 @@
         const res = await fetch(url, { method:"POST", headers, body, credentials:"include", redirect:"manual", signal:ac.signal });
         active.delete(id);
 
-        if (res.type === "opaqueredirect" || (res.status >=300 && res.status < 400)) {
-          setStatus("Redirect detected → keep same-origin.", "#b45309");
-          lastErr = {ok:false, msg:"redirect"}; continue;
-        }
+        if (res.type==="opaqueredirect" || (res.status>=300 && res.status<400)) { lastErr={ok:false,msg:"redirect"}; continue; }
         if ([403,419,429,503].includes(res.status)) {
-          noteFail(url);
-          lastErr = {ok:false, msg:`HTTP ${res.status}`};
-          if (res.status===429) setStatus("Rate limited. Retrying later…", "#b45309");
+          noteFail(url); lastErr = {ok:false, msg:`HTTP ${res.status}`};
+          if (res.status===429) setStatus("Rate limited. Try again later…", "#b45309");
           if (res.status===403 || res.status===419) setStatus("CF/Session challenge — Solve Turnstile first.", "#b91c1c");
-          // do not try next base for 403/419 → break
           return lastErr;
         }
         if (res.status===404 || res.status===405){ lastErr = {ok:false, msg:`HTTP ${res.status}`}; continue; }
-
         if (!res.ok){ noteFail(url); lastErr = {ok:false, msg:`HTTP ${res.status}`}; continue; }
 
         noteOk(url);
         const data = await res.json().catch(()=> ({}));
-        return {ok:true, data, msg: data?.message || data?.msg || "OK", url};
+        return {ok:true, data, msg:data?.message||data?.msg||"OK", url};
       }catch(e){
-        active.delete(id); noteFail(url);
-        lastErr = {ok:false, msg:e.message || "Network error"}; continue;
+        active.delete(id); noteFail(url); lastErr = {ok:false, msg:e.message||"Network"}; continue;
       }
     }
-    return lastErr || {ok:false, msg:"No route matched"};
+    return lastErr || {ok:false, msg:"no-route"};
   }
 
   /************** UI BUILD **************/
-  function buildUI(){
-    injectCSS();
+  function injectUI(){
+    if(document.getElementById("alx-style")) return;
+    const st=document.createElement("style"); st.id="alx-style"; st.textContent=css; document.head.appendChild(st);
+
     const root = document.createElement("div"); root.className="alx-root";
     const card = document.createElement("div"); card.className="alx-card"; root.appendChild(card);
 
@@ -244,7 +272,6 @@
       [tLogin,tBGD,tPay].forEach((t,idx)=> t.classList.toggle("active", idx===i));
       [viewLogin,viewBGD,viewPay].forEach((v,idx)=> v.style.display = idx===i? "block":"none");
     }
-    // Draggable
     function makeDraggable(el, handle){
       let dragging=false, offX=0, offY=0;
       handle.addEventListener("mousedown", e=>{ dragging=true; const r=el.getBoundingClientRect(); offX = e.clientX - r.left; offY = e.clientY - r.top; e.preventDefault(); });
@@ -284,9 +311,16 @@
     async function onMobileVerify(){
       const num = mobile.value.trim();
       if(!/^\d{11}$/.test(num)){ toast("Invalid mobile number", false); return; }
-      const res = await postFormMulti("mobileVerify", { mobile_no: num }, /*needTS*/true, /*auth*/false);
-      res?.ok ? toast("Verification sent") : toast(res?.msg || "Failed", false);
+
+      const t = localStorage.getItem(TS_KEY) ||
+                (document.querySelector('input[name="captcha_token"]')||{}).value ||
+                (document.querySelector('input[name="cf-turnstile-response"]')||{}).value || "";
+      if (!t) { setStatus("Solve Turnstile first, then try.", "#b45309"); focusTurnstileWidget(); return; }
+
+      const ok = nativeMobileVerify(num);
+      if (ok) { setStatus("Submitting mobile-verify via native form…", "#0ea5e9"); toast("Submitting…"); }
     }
+
     async function onLoginWithPassword(){
       const num = mobile.value.trim(), pw=pass.value;
       if(!/^\d{11}$/.test(num) || !pw){ toast("Mobile/password required", false); return; }
@@ -460,10 +494,8 @@
 
   /************** ENTRY **************/
   (function init(){
-    injectCSS(); buildUI(); startTurnstileWatcher();
-    // hotkey
+    injectCSS(); injectUI(); startTurnstileWatcher();
     window.addEventListener("keydown", (e)=>{ if(e.altKey && (e.key==="d"||e.key==="D")) openDataModal(); });
-    // expose
     window.__IVAC__ = { openDataModal, stopAll, focusTurnstileWidget };
   })();
 
