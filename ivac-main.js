@@ -1,7 +1,7 @@
-/* ivac-main.js — ALLEX IVAC Automation (Final + Turnstile Ready)
+/* ivac-main.js — ALLEX IVAC Automation (Final + Turnstile Fixed: captcha_token)
  * UI: Login | BGD & OTP | Payment — floating, draggable
  * CORS-safe: same-origin + form-POST (no preflight)
- * Turnstile: auto-detect + token capture + attach to critical endpoints
+ * Turnstile: auto-detect + token capture (captcha_token or cf-turnstile-response)
  * Safety: per-origin backoff, OTP single-flight, request de-dupe, STOP ALL
  * Hotkeys: Alt + D → Add/Edit Data modal
  */
@@ -80,9 +80,11 @@
 
   // Capture latest turnstile token whenever the widget verifies
   function startTurnstileWatcher() {
-    // 1) hidden input value (most pages use this name)
+    // 1) hidden input value — supports both names
     function snapshot() {
-      const inp = document.querySelector('input[name="cf-turnstile-response"]');
+      const inp =
+        document.querySelector('input[name="captcha_token"]') ||
+        document.querySelector('input[name="cf-turnstile-response"]');
       const val = inp && inp.value ? inp.value.trim() : "";
       if (val) localStorage.setItem(TS_KEY, val);
       return val;
@@ -180,12 +182,17 @@
   async function postForm(url, dataObj, includeAuth=false){
     await backoffGuard(url);
 
-    // Turnstile token auto-attach where relevant
-    const needTS = /mobile-verify|login|login-otp|pay-otp-sent|pay-now/i.test(url);
+    // Turnstile token auto-attach: ONLY for mobile-verify (server expects 'captcha_token')
+    const needTS = /mobile-verify/i.test(url);
     if (needTS) {
       const t = localStorage.getItem(TS_KEY) || "";
-      if (!t) setStatus("Turnstile token missing. Click 'Solve Turnstile' and try again.", "#b45309");
-      if (t) dataObj = { ...(dataObj||{}), "cf-turnstile-response": t };
+      if (!t) {
+        setStatus("Turnstile token missing. Click 'SOLVE TURNSTILE' and try again.", "#b45309");
+      } else {
+        dataObj = { ...(dataObj||{}), "captcha_token": t };
+        // Optional safety (if backend sometimes expects the other name):
+        // dataObj["cf-turnstile-response"] = t;
+      }
     }
 
     const body = new URLSearchParams();
@@ -286,7 +293,7 @@
 
     const ready = input("Ready"); ready.disabled = true;
 
-    // NEW: Solve Turnstile helper button
+    // Turnstile helper button
     const tsBtn = button("SOLVE TURNSTILE","b-purple", focusTurnstileWidget);
 
     const mobile = input("Enter mobile number (11 digits)");
@@ -314,6 +321,7 @@
     async function onMobileVerify(){
       const num = mobile.value.trim();
       if(!/^\d{11}$/.test(num)){ toast("Invalid mobile number", false); return; }
+      // NOTE: server expects mobile_no + captcha_token
       const res = await postForm(URLS.mobileVerify, { mobile_no: num });
       res.ok ? toast("Verification sent") : toast(res.msg || "Failed", false);
     }
