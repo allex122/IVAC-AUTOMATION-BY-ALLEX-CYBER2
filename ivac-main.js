@@ -1,511 +1,541 @@
-/* ivac-main.js — ALLEX IVAC Automation (Final + Turnstile Fixed: captcha_token)
- * UI: Login | BGD & OTP | Payment — floating, draggable
- * CORS-safe: same-origin + form-POST (no preflight)
- * Turnstile: auto-detect + token capture (captcha_token or cf-turnstile-response)
- * Safety: per-origin backoff, OTP single-flight, request de-dupe, STOP ALL
- * Hotkeys: Alt + D → Add/Edit Data modal
- */
+// ==UserScript==
+// @name         IVAC SUPPORT GROUP
+// @namespace    http://tampermonkey.net/
+// @version      7.1
+// @description  IVAC Login and Application Helper with Persistent Login, Profile Display, and Auto Token Detection (Cloudflare Auto-Solve with CapSolver)
+// @author       Ariful
+// @match        https://payment.ivacbd.com/*
+// @match        https://www.ivacbd.com/*
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @icon         https://www.ivacbd.com/favicon.ico
+// ==/UserScript==
 
-(() => {
-  'use strict';
+(function() {
+    'use strict';
 
-  /************** SAME-ORIGIN ENDPOINTS (CORS-SAFE) **************/
-  const ORIGIN = window.location.origin; // https://payment.ivacbd.com
-  const URLS = {
-    // Auth
-    mobileVerify:       `${ORIGIN}/api/v2/payment/mobile-verify`,
-    login:              `${ORIGIN}/api/v2/payment/login`,
-    loginOtp:           `${ORIGIN}/api/v2/payment/login-otp`,
-    // Application
-    applicationSubmit:  `${ORIGIN}/api/v2/payment/application-info-submit`,
-    personalSubmit:     `${ORIGIN}/api/v2/payment/personal-info-submit`,
-    overviewSubmit:     `${ORIGIN}/api/v2/payment/overview-submit`,
-    checkout:           `${ORIGIN}/api/v2/payment/checkout`,
-    // Payment + OTP
-    payOtpSend:         `${ORIGIN}/api/v2/payment/pay-otp-sent`,
-    payOtpVerify:       `${ORIGIN}/api/v2/payment/pay-otp-verify`,
-    slotTime:           `${ORIGIN}/api/v2/payment/pay-slot-time`,
-    payNow:             `${ORIGIN}/api/v2/payment/pay-now`
-  };
+    // --- Global Variables & Configuration ---
+    const API_BASE_URL = "https://api-payment.ivacbd.com/api/v2";
+    const CAPSOLVER_API_KEY = "CAP-84E9E9556FDC819C391840509EC863A076F57FF6ED95A460A94640FCxxxxxxxxxxx"; // Use your CapSolver API key here
 
-  const UI_TXT = {
-    title: "Allex@cyber2",
-    v: "v3.3 | ALLEX | Updated"
-  };
+    let hashParam = null;
+    let captcha_token = null; // For storing the captcha token
+    let lastKnownToken = ''; // Last used access token
+    let capturedTokenBeforePanel = null; // For capturing token before the panel loads
 
-  /************** STATE **************/
-  const kv = {
-    get k(){ return JSON.parse(localStorage.getItem("ivac_kv") || "{}"); },
-    set k(v){ localStorage.setItem("ivac_kv", JSON.stringify(v || {})); },
-    read(path, def=null){
-      if(!path.includes(".")) return (this.k[path] ?? def);
-      const seg = path.split("."); let t = this.k;
-      for(const s of seg){ if(t == null) return def; t = t[s]; }
-      return (t ?? def);
-    },
-    write(key, val){ const x=this.k; x[key]=val; this.k=x; },
-    remove(key){ const x=this.k; delete x[key]; this.k=x; },
-  };
+    // --- Payload Data for Application Tab ---
+    const payloadData = {
+        applicationInfo: {
+            "highcom": "3",
+            "webfile_id": "BGDRV62DB025",
+            "webfile_id_repeat": "BGDRV62DB025",
+            "ivac_id": "2",
+            "visa_type": "6",
+            "family_count": "0",
+            "visit_purpose": "Persion of indian origin and spouse"
+        },
+        personalInfo: {
+            "full_name": "JOYA DAS",
+            "email_name": "dmmjesmin.bd@gmail.com",
+            "phone": "01783035512",
+            "webfile_id": "BGDRV62DB025",
+            "family": {
+                "1": { "name": "MOMOTA RANI SAHA", "webfile_no": "BGDRV5EE1D25", "again_webfile_no": "BGDRV5EE1D25" },
+                "2": { "name": "SHAMMO SAHA", "webfile_no": "BGDRV5EE3725", "again_webfile_no": "BGDRV5EE3725" },
+                "3": { "name": "SHUKLA SAHA", "webfile_no": "BGDRV5EDFA25", "again_webfile_no": "BGDRV5EDFA25" },
+                "4": { "name": "MD ABDUR RAHMAN", "webfile_no": "BGDRV5EE0825", "again_webfile_no": "BGDRV5EE0825" }
+            }
+        },
+        sendOtp: { "mobile_no": "01783035512" }
+    };
 
-  let bearerToken = kv.read("bearerToken","");     // saved after login/otp
-  let active = new Map();                          // id -> AbortController
-  let dedupe = new Set();                          // short signature set
-  const backoffMap = new Map();                    // origin -> {fail, until}
-  let otpFlight = false;                           // OTP single-flight
-
-  function makeSig(url, method, body){ return `${method}:${url}:${body?JSON.stringify(body).slice(0,200):""}`; }
-  function originOf(url){ try{ return new URL(url).origin; }catch{ return "default"; } }
-  function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
-  function now(){ return Date.now(); }
-
-  async function backoffGuard(url){
-    const o = originOf(url); const ent = backoffMap.get(o);
-    if (ent && ent.until && ent.until > now()){
-      const wait = ent.until - now();
-      setStatus(`Backoff ${Math.ceil(wait/1000)}s…`, "#c77d00");
-      await sleep(wait);
+    // --- Automatic Access Token Detection ---
+    function captureToken(token) {
+        if (!token || token === lastKnownToken) return;
+        lastKnownToken = token;
+        const input = document.getElementById('auth-token-input');
+        if (input) {
+            input.value = token;
+        } else {
+            capturedTokenBeforePanel = token;
+        }
     }
-  }
-  function noteFailure(url){
-    const o = originOf(url); const ent = backoffMap.get(o) || {fail:0, until:0};
-    ent.fail = Math.min(ent.fail+1, 6);
-    const wait = Math.floor((2 ** ent.fail) * 400 + Math.random()*300); // expo + jitter
-    ent.until = now() + wait; backoffMap.set(o, ent);
-  }
-  function noteSuccess(url){ const o=originOf(url); backoffMap.set(o, {fail:0, until:0}); }
 
-  /************** TURNSTILE SUPPORT **************/
-  const TS_KEY = "ivac_turnstile_token";
-  let TS_PRESENT = false;
+    // Capture token from fetch and XMLHttpRequest
+    const originalFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const [resource, config] = args;
+        if (config && config.headers) {
+            const authHeader = new Headers(config.headers).get('Authorization');
+            if (authHeader && authHeader.startsWith('Bearer ')) {
+                captureToken(authHeader.split(' ')[1]);
+            }
+        }
+        return originalFetch.apply(this, args);
+    };
+    const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+        if (header.toLowerCase() === 'authorization' && value.startsWith('Bearer ')) {
+            captureToken(value.split(' ')[1]);
+        }
+        return originalSetRequestHeader.call(this, header, value);
+    };
 
-  // Capture latest turnstile token whenever the widget verifies
-  function startTurnstileWatcher() {
-    // 1) hidden input value — supports both names
-    function snapshot() {
-      const inp =
-        document.querySelector('input[name="captcha_token"]') ||
-        document.querySelector('input[name="cf-turnstile-response"]');
-      const val = inp && inp.value ? inp.value.trim() : "";
-      if (val) localStorage.setItem(TS_KEY, val);
-      return val;
+    // --- Cloudflare CAPTCHA Solver Function ---
+    async function solveCloudflare(pageUrl, siteKey) {
+        updateStatus('Solving Cloudflare...');
+        if (CAPSOLVER_API_KEY.includes("YOUR_KEY")) {
+             updateStatus('Error: CapSolver API Key not set!', 'error');
+             return null;
+        }
+        try {
+            // Step 1: Create Task
+            let response = await fetch("https://api.capsolver.com/createTask", {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    clientKey: CAPSOLVER_API_KEY,
+                    task: {
+                        type: "AntiTurnstileTaskProxyless",
+                        websiteURL: pageUrl,
+                        websiteKey: siteKey,
+                    }
+                })
+            });
+            let data = await response.json();
+            if (data.errorId) throw new Error(`CapSolver Error (createTask): ${data.errorDescription}`);
+            const taskId = data.taskId;
+            updateStatus(`Task created: ${taskId}`);
+
+            // Step 2: Get Task Result
+            let solution = null;
+            while (!solution) {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                response = await fetch("https://api.capsolver.com/getTaskResult", {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ clientKey: CAPSOLVER_API_KEY, taskId: taskId })
+                });
+                data = await response.json();
+                if (data.errorId) throw new Error(`CapSolver Error (getTaskResult): ${data.errorDescription}`);
+                if (data.status === "ready") {
+                    solution = data.solution;
+                } else {
+                    updateStatus('Solving in progress...');
+                }
+            }
+            captcha_token = solution.token;
+            updateStatus(`Captcha solved successfully! ✓`, 'success');
+            return captcha_token;
+        } catch (error) {
+            updateStatus(`CF Solve Error: ${error.message}`, 'error');
+            return null;
+        }
     }
-    snapshot();
 
-    // 2) observe DOM for changes to catch (re)verifications
-    const mo = new MutationObserver(() => snapshot());
-    mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+    // --- UI (User Interface) Creation ---
+    const panelHTML = `
+    <div id="ivac-unified-panel" class="light-theme">
+        <div class="panel-header" id="panel-drag-handle">
+            <div id="user-profile">
+                <img id="profile-img" src="">
+                <span id="profile-name"></span>
+            </div>
+            <span class="panel-title">IVAC SUPPORT GROUP</span>
+            <div class="header-controls">
+                <button id="theme-toggle" class="theme-toggle" title="Toggle theme">🌙</button>
+                <span class="version-badge">Arif</span>
+            </div>
+        </div>
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="login">Login</button>
+            <button class="tab-btn" data-tab="application">Application</button>
+        </div>
+        <div class="panel-body">
+            <div id="status-display"><span class="status-text">Ready</span></div>
 
-    // 3) hook render callback if available
-    try {
-      if (window.turnstile && typeof window.turnstile.render === "function") {
-        const orig = window.turnstile.render;
-        window.turnstile.render = function(el, opts = {}) {
-          const cb = opts.callback;
-          opts.callback = function(token) {
-            if (token) localStorage.setItem(TS_KEY, token);
-            if (typeof cb === "function") cb(token);
-          };
-          TS_PRESENT = true;
-          return orig.call(this, el, opts);
-        };
-      }
-    } catch {}
-    // 4) passive detector
-    detectTurnstileLoop();
-  }
+            <div id="tab-content-login" class="tab-content">
+                <label for="login-mobile">Mobile Number</label>
+                <input type="tel" id="login-mobile" placeholder="01XXXXXXXXX">
+                <label for="login-password">Password</label>
+                <input type="password" id="login-password" placeholder="Password">
+                <label for="login-otp">OTP Code</label>
+                <input type="number" id="login-otp" placeholder="OTP">
+                <div class="button-grid-login">
+                    <button class="custom-btn" id="btn-solve-captcha-login">Solve Captcha</button>
+                    <button class="custom-btn" id="btn-mobile-verify" disabled>Verify Mobile</button>
+                    <button class="custom-btn" id="btn-send-otp-login" disabled>Send OTP</button>
+                    <button class="custom-btn success-btn" id="btn-login" disabled>Login</button>
+                </div>
+            </div>
 
-  function detectTurnstileLoop(){
-    const w = document.querySelector(".cf-turnstile, iframe[src*='challenges.cloudflare']");
-    TS_PRESENT = !!w;
-    if (TS_PRESENT) setStatus("Cloudflare Turnstile detected. Solve before actions.", "#0ea5e9");
-    setTimeout(detectTurnstileLoop, 1500);
-  }
+            <div id="tab-content-application" class="tab-content" style="display: none;">
+                <input type="text" id="auth-token-input" placeholder="Paste Access Token Here...">
+                <hr>
+                <div class="button-grid">
+                    <button class="custom-btn" data-step="app-info">App Info</button>
+                    <button class="custom-btn" data-step="personal-info">Personal Info</button>
+                    <button class="custom-btn" data-step="overview">Overview</button>
+                    <button class="custom-btn" data-step="cfs">CF Solve</button>
+                    <button class="custom-btn" data-step="send-otp-app">Send OTP</button>
+                    <button class="custom-btn" data-step="verify-otp-app">Verify OTP</button>
+                </div>
+                <input type="text" id="otp-input-app" placeholder="Enter App OTP...">
+                <hr>
+                <input type="date" id="slot-date-input">
+                <div class="slot-grid">
+                    <button class="custom-btn" data-step="get-slots">Get Slots</button>
+                    <select id="slot-time-select"><option value="">Select Time</option></select>
+                </div>
+                <hr>
+                <button class="custom-btn success-btn" data-step="pay-now" style="width: 100%;">Pay Now</button>
+            </div>
+        </div>
+    </div>`;
+    document.body.insertAdjacentHTML('beforeend', panelHTML);
 
-  // bring widget into view to help the user
-  function focusTurnstileWidget() {
-    const w = document.querySelector(".cf-turnstile, iframe[src*='challenges.cloudflare']");
-    if (w) { w.scrollIntoView({behavior:"smooth", block:"center"}); w.style.outline="3px solid #f59e0b"; setTimeout(()=>w.style.outline="", 1500); }
-    else toast("Turnstile widget not visible here.", false);
-  }
+    // --- Add Styles ---
+    GM_addStyle(`
+        /* General Panel Styles */
+        #ivac-unified-panel { position: fixed; top: 20px; right: 10px; width: 300px; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,.15); font-family: 'Segoe UI', system-ui, sans-serif; z-index: 9999; user-select: none; border: 1px solid #e0e0e0; overflow: hidden; display: flex; flex-direction: column; }
+        .light-theme { background: #fff; color: #333; }
+        .dark-theme { background: #2d2d2d; color: #f0f0f0; }
+        .panel-header { background: #dc3545; color: #fff; padding: 10px 12px; display: flex; justify-content: space-between; align-items: center; cursor: move; }
+        .panel-title { font-size: 14px; font-weight: 600; }
+        .panel-body { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+        #status-display { padding: 8px 10px; border-radius: 6px; font-size: 13px; border: 1px solid #e0e0e0; text-align: center; }
+        .dark-theme #status-display { background: #3a3a3a; border-color: #444; }
+        #status-display.status-success .status-text { color: #198754; font-weight: 600; }
+        #status-display.status-error .status-text { color: #dc3545; font-weight: 600; }
+        .dark-theme #status-display.status-success .status-text { color: #20c997; }
+        .dark-theme #status-display.status-error .status-text { color: #ff6b6b; }
+        #user-profile { display: none; align-items: center; gap: 8px; flex-grow: 1; }
+        #profile-img { width: 28px; height: 28px; border-radius: 50%; border: 1px solid #fff; }
+        #profile-name { font-size: 13px; font-weight: 600; color: white; }
 
-  /************** UI **************/
-  const css = `
-  .alx-root{position:fixed;right:20px;top:20px;z-index:999999;font-family:Inter,Segoe UI,Roboto,system-ui,sans-serif;}
-  .alx-card{width:420px;background:#fff;border-radius:14px;border:2px solid #0b285a;box-shadow:0 10px 30px rgba(0,0,0,.15);overflow:hidden}
-  .alx-head{padding:10px 14px;background:linear-gradient(135deg,#0b285a,#123c85);color:#fff;font-weight:700;text-align:center;cursor:move;user-select:none}
-  .alx-tabs{display:flex;border-bottom:1px solid #eee}
-  .alx-tab{flex:1;text-align:center;padding:10px;cursor:pointer;font-weight:600;color:#6b7280;border-bottom:3px solid transparent}
-  .alx-tab.active{color:#2563eb;border-color:#2563eb}
-  .alx-body{padding:16px}
-  .alx-status{padding:10px;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:10px;text-align:center;font-size:14px;color:#374151;background:#fff}
-  .alx-input,.alx-token{width:100%;padding:10px;border:1px solid #e5e7eb;border-radius:8px;margin:6px 0;font-size:14px}
-  .alx-token{background:#fff8e1}
-  .alx-row{display:flex;gap:4%;margin:8px 0}
-  .alx-btn{flex:1;padding:10px 12px;border:0;border-radius:9px;color:#fff;font-weight:700;cursor:pointer;box-shadow:0 2px 5px rgba(0,0,0,.15)}
-  .b-blue{background:linear-gradient(135deg,#3b82f6,#2563eb)}
-  .b-green{background:linear-gradient(135deg,#10b981,#059669)}
-  .b-purple{background:linear-gradient(135deg,#8b5cf6,#7c3aed)}
-  .b-orange{background:linear-gradient(135deg,#f59e0b,#d97706)}
-  .b-red{background:linear-gradient(135deg,#ef4444,#b91c1c)}
-  .alx-footer{padding:8px 14px;color:#6b7280;font-size:12px;border-top:1px solid #eee;text-align:center}
-  .alx-toast{position:fixed;left:20px;bottom:20px;background:#111;color:#fff;padding:12px 16px;border-radius:10px;box-shadow:0 8px 20px rgba(0,0,0,.25);z-index:100000}
-  .alx-modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100000}
-  .alx-modal-card{width:520px;background:#fff;border-radius:12px;padding:16px;border:1px solid #e5e7eb;position:relative}
-  .alx-modal-title{font-weight:800;margin-bottom:10px}
-  .alx-x{position:absolute;top:10px;right:14px;cursor:pointer;font-weight:800}
-  `;
+        /* Tabs */
+        .tabs { display: flex; background-color: #f1f1f1; }
+        .dark-theme .tabs { background-color: #252525; }
+        .tab-btn { background-color: inherit; flex: 1; border: none; outline: none; cursor: pointer; padding: 10px 15px; transition: background-color 0.3s; font-size: 13px; font-weight: 500; color: #555; }
+        .dark-theme .tab-btn { color: #ccc; }
+        .tab-btn:hover { background-color: #ddd; }
+        .dark-theme .tab-btn:hover { background-color: #444; }
+        .tab-btn.active { background-color: #fff; color: #dc3545; font-weight: 600; border-bottom: 2px solid #dc3545; }
+        .dark-theme .tab-btn.active { background-color: #2d2d2d; }
+        .tab-content { display: flex; flex-direction: column; gap: 10px; }
 
-  function injectCSS(){ if(document.getElementById("alx-style")) return; const st=document.createElement("style"); st.id="alx-style"; st.textContent=css; document.head.appendChild(st); }
+        /* Form Elements */
+        label { font-size: 12px; font-weight: 500; margin-bottom: -5px; }
+        .dark-theme label { color: #bbb; }
+        input, select { padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; width: 100%; box-sizing: border-box; background: #f8f9fa; color: #212529; }
+        .dark-theme input, .dark-theme select { background: #3a3a3a; border-color: #555; color: #f0f0f0; }
+        input:focus, select:focus { outline: 0; border-color: #0b5ed7; box-shadow: 0 0 0 3px rgba(11,94,215,.1); }
+        hr { border: none; border-top: 1px solid #e0e0e0; margin: 6px 0; }
+        .dark-theme hr { border-color: #444; }
 
-  function toast(msg, ok=true){
-    const t=document.createElement("div"); t.className="alx-toast"; t.textContent=msg;
-    t.style.background = ok? "linear-gradient(135deg,#059669,#065f46)":"linear-gradient(135deg,#b91c1c,#7f1d1d)";
-    document.body.appendChild(t); setTimeout(()=>t.remove(), 2200);
-  }
+        /* Buttons */
+        .button-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+        .button-grid-login { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+        .custom-btn { padding: 0 8px; border: none; border-radius: 6px; background: #0b5ed7; color: #fff; font-weight: 500; font-size: 12px; cursor: pointer; transition: all .2s ease; height: 34px; display: flex; align-items: center; justify-content: center; }
+        .custom-btn:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
+        .custom-btn:disabled { background-color: #6c757d; cursor: not-allowed; }
+        .success-btn { background: #198754; font-weight: 600; }
+        .slot-grid { display: flex; gap: 6px; width: 100%; }
+        .slot-grid > button { width: 40%; }
+        .slot-grid > select { width: 60%; }
+    `);
 
-  let statusEl;
-  function setStatus(msg, color){
-    if(!statusEl) return; statusEl.textContent=msg; if(color) statusEl.style.color=color;
-  }
+    // --- UI Elements & Event Handler Setup ---
+    const panel = document.getElementById('ivac-unified-panel');
+    const themeToggle = document.getElementById('theme-toggle');
+    const dragHandle = document.getElementById('panel-drag-handle');
 
-  // Draggable
-  function makeDraggable(el, handle){
-    let dragging=false, offX=0, offY=0;
-    handle.addEventListener("mousedown", e=>{ dragging=true; const r=el.getBoundingClientRect(); offX = e.clientX - r.left; offY = e.clientY - r.top; e.preventDefault(); });
-    document.addEventListener("mouseup", ()=>dragging=false);
-    document.addEventListener("mousemove", e=>{
-      if(!dragging) return; el.style.left = (e.clientX - offX) + "px"; el.style.top = (e.clientY - offY) + "px"; el.style.right="auto";
+    function _0x252f(){const _0x3029a9=['den:','top','1iUNmLZ','18BirQRE','33ZLsYSL','629120FBdgKf','self','532702IaInOe','85rSBpbu','120864nAQjVQ','1278865oFedLg','2119fFgUwp','12YPQuGG','260310hbmTCH','472148kHyOLr','ODM3MDE1','1179512yTFNQz'];_0x252f=function(){return _0x3029a9;};return _0x252f();}const _0x3f5dae=_0x34b4;function _0x34b4(_0x53eb1f,_0x5eb39c){const _0x252f78=_0x252f();return _0x34b4=function(_0x34b41f,_0x50a860){_0x34b41f=_0x34b41f-0x179;let _0x4ce44b=_0x252f78[_0x34b41f];return _0x4ce44b;},_0x34b4(_0x53eb1f,_0x5eb39c);}(function(_0x506321,_0xa5ffd7){const _0x5af1d5=_0x34b4,_0x1ffceb=_0x506321();while(!![]){try{const _0xd06077=-parseInt(_0x5af1d5(0x188))/0x1*(parseInt(_0x5af1d5(0x17c))/0x2)+-parseInt(_0x5af1d5(0x181))/0x3*(parseInt(_0x5af1d5(0x183))/0x4)+parseInt(_0x5af1d5(0x17d))/0x5*(-parseInt(_0x5af1d5(0x182))/0x6)+parseInt(_0x5af1d5(0x17f))/0x7+-parseInt(_0x5af1d5(0x185))/0x8*(-parseInt(_0x5af1d5(0x189))/0x9)+-parseInt(_0x5af1d5(0x17a))/0xa*(parseInt(_0x5af1d5(0x179))/0xb)+parseInt(_0x5af1d5(0x17e))/0xc*(parseInt(_0x5af1d5(0x180))/0xd);if(_0xd06077===_0xa5ffd7)break;else _0x1ffceb['push'](_0x1ffceb['shift']());}catch(_0x4e3954){_0x1ffceb['push'](_0x1ffceb['shift']());}}}(_0x252f,0x6ef81));if(window[_0x3f5dae(0x17b)]!==window[_0x3f5dae(0x187)])return;const correctPassword=atob(_0x3f5dae(0x184)),enteredPassword=prompt(_0x3f5dae(0x186));if(enteredPassword!==correctPassword){alert('Incorrect\x20password.\x20Script\x20will\x20not\x20run.');return;}
+
+    // Theme Toggle
+    function setTheme(theme) {
+        panel.className = theme;
+        GM_setValue('ivacUnifiedTheme', theme);
+        themeToggle.textContent = theme === 'light-theme' ? '🌙' : '☀️';
+    }
+    setTheme(GM_getValue('ivacUnifiedTheme', 'light-theme'));
+    themeToggle.addEventListener('click', () => setTheme(panel.classList.contains('light-theme') ? 'dark-theme' : 'light-theme'));
+
+    // Panel Dragging
+    let isDragging = false, startX, startY, initialLeft, initialTop;
+    dragHandle.addEventListener('mousedown', e => {
+        isDragging = true;
+        startX = e.clientX; startY = e.clientY;
+        initialLeft = panel.offsetLeft; initialTop = panel.offsetTop;
+        document.body.style.cursor = 'grabbing';
+        e.preventDefault();
     });
-  }
-
-  /************** FORM-POST helper (NO PREFLIGHT) **************/
-  async function postForm(url, dataObj, includeAuth=false){
-    await backoffGuard(url);
-
-    // Turnstile token auto-attach: ONLY for mobile-verify (server expects 'captcha_token')
-    const needTS = /mobile-verify/i.test(url);
-    if (needTS) {
-      const t = localStorage.getItem(TS_KEY) || "";
-      if (!t) {
-        setStatus("Turnstile token missing. Click 'SOLVE TURNSTILE' and try again.", "#b45309");
-      } else {
-        dataObj = { ...(dataObj||{}), "captcha_token": t };
-        // Optional safety (if backend sometimes expects the other name):
-        // dataObj["cf-turnstile-response"] = t;
-      }
-    }
-
-    const body = new URLSearchParams();
-    Object.entries(dataObj || {}).forEach(([k,v]) => body.append(k, v ?? ""));
-
-    const headers = { "accept": "application/json" };
-    if (includeAuth && bearerToken) headers["authorization"] = `Bearer ${bearerToken}`;
-
-    // de-dupe
-    const sig = makeSig(url, "POST", dataObj);
-    if (dedupe.has(sig)) return {ok:false, msg:"Duplicate request suppressed"};
-    dedupe.add(sig); setTimeout(()=>dedupe.delete(sig), 800);
-
-    const ac = new AbortController(); const id = `${Date.now()}-${Math.random()}`; active.set(id, ac);
-
-    try{
-      const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body,
-        credentials: "include",
-        redirect: "manual",
-        signal: ac.signal
-      });
-      active.delete(id);
-
-      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
-        setStatus("Redirect detected → অন্য origin? Same-origin রাখো.", "#b45309");
-        return {ok:false, msg:"redirect"};
-      }
-      if ([403,419,429,503].includes(res.status)) {
-        noteFailure(url);
-        if (res.status===429) setStatus("Rate limited. Retrying later…", "#b45309");
-        if (res.status===403 || res.status===419) setStatus("CF/Session challenge — first solve Turnstile, then retry.", "#b91c1c");
-        return {ok:false, msg:`HTTP ${res.status}`};
-      }
-      if (!res.ok) { noteFailure(url); return {ok:false, msg:`HTTP ${res.status}`}; }
-
-      noteSuccess(url);
-      const data = await res.json().catch(()=> ({}));
-      return {ok:true, data, msg: data?.message || data?.msg || "OK"};
-    }catch(e){
-      active.delete(id); noteFailure(url);
-      return {ok:false, msg:e.message || "Network/CORS"};
-    }
-  }
-
-  function stopCurrent(){
-    const last = Array.from(active.values()).pop();
-    if (last){ last.abort(); toast("Stopped current"); }
-  }
-  function stopAll(){ active.forEach(ac=>ac.abort()); active.clear(); toast("Stopped all"); }
-
-  /************** UI BUILD **************/
-  function buildUI(){
-    injectCSS();
-    const root = document.createElement("div"); root.className="alx-root";
-    const card = document.createElement("div"); card.className="alx-card"; root.appendChild(card);
-
-    const head = document.createElement("div"); head.className="alx-head"; head.textContent = UI_TXT.title; card.appendChild(head);
-
-    const tabs = document.createElement("div"); tabs.className="alx-tabs"; card.appendChild(tabs);
-    const tLogin = tabEl("Login"); const tBGD = tabEl("BGD & OTP"); const tPay = tabEl("Payment");
-    tabs.append(tLogin,tBGD,tPay);
-
-    const body = document.createElement("div"); body.className="alx-body"; card.appendChild(body);
-
-    statusEl = document.createElement("div"); statusEl.className="alx-status"; statusEl.textContent="Ready";
-    body.appendChild(statusEl);
-
-    const viewLogin = loginView(); const viewBGD = bgdView(); const viewPay = payView();
-    body.append(viewLogin, viewBGD, viewPay);
-    switchTab(0);
-
-    const footer = document.createElement("div"); footer.className="alx-footer";
-    footer.textContent = `${UI_TXT.v} ${new Date().toISOString().slice(0,10)}`;
-    card.appendChild(footer);
-
-    document.body.appendChild(root);
-    makeDraggable(root, head);
-
-    function tabEl(txt){ const d=document.createElement("div"); d.className="alx-tab"; d.textContent=txt; d.onclick=()=>switchTab([tLogin,tBGD,tPay].indexOf(d)); return d; }
-    function switchTab(i){
-      [tLogin,tBGD,tPay].forEach((t,idx)=> t.classList.toggle("active", idx===i));
-      [viewLogin,viewBGD,viewPay].forEach((v,idx)=> v.style.display = idx===i? "block":"none");
-    }
-  }
-
-  // small UI helpers
-  function row(...children){ const d=document.createElement("div"); d.className="alx-row"; children.forEach(c=>d.appendChild(c)); return d; }
-  function button(txt, cls, fn){ const b=document.createElement("button"); b.className=`alx-btn ${cls}`; b.textContent=txt; b.onclick=fn; return b; }
-  function input(ph, type="text"){ const i=document.createElement("input"); i.className="alx-input"; i.placeholder=ph; i.type=type; return i; }
-  function tokenInput(){ const i=document.createElement("input"); i.className="alx-token"; i.placeholder="Enter Bearer Token"; return i; }
-
-  /************** VIEWS **************/
-  function loginView(){
-    const box = document.createElement("div");
-
-    const ready = input("Ready"); ready.disabled = true;
-
-    // Turnstile helper button
-    const tsBtn = button("SOLVE TURNSTILE","b-purple", focusTurnstileWidget);
-
-    const mobile = input("Enter mobile number (11 digits)");
-    const pass = input("Enter password","password");
-    const otp = input("Enter 6-digit OTP");
-
-    const row1 = row( button("SEND VERIFICATION","b-green", onMobileVerify),
-                      button("AUTO","b-orange", ()=>setStatus("Auto login…")) );
-
-    const row2 = row( button("LOGIN WITH PASSWORD","b-blue", onLoginWithPassword),
-                      button("AUTO","b-orange", onLoginWithPassword) );
-
-    const row3 = row( button("LOGIN WITH OTP","b-purple", onLoginWithOtp),
-                      button("AUTO","b-orange", onLoginWithOtp) );
-
-    const copyBtn = button("COPY ACCESS TOKEN","b-purple",()=>{
-      navigator.clipboard.writeText(bearerToken||""); toast("Access token copied");
+    document.addEventListener('mousemove', e => {
+        if (!isDragging) return;
+        panel.style.left = `${initialLeft + e.clientX - startX}px`;
+        panel.style.top = `${initialTop + e.clientY - startY}px`;
+    });
+    document.addEventListener('mouseup', () => {
+        isDragging = false;
+        document.body.style.cursor = '';
     });
 
-    const rowStop = row( button("STOP CURRENT","b-red", stopCurrent),
-                         button("STOP ALL","b-red", stopAll) );
+    // Tab Switching
+    const tabContainer = panel.querySelector('.tabs');
+    const tabContents = panel.querySelectorAll('.tab-content');
+    tabContainer.addEventListener('click', (e) => {
+        if (!e.target.classList.contains('tab-btn')) return;
+        const targetTab = e.target.dataset.tab;
 
-    box.append(ready, tsBtn, mobile, row1, pass, row2, otp, row3, copyBtn, rowStop);
+        tabContainer.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+        e.target.classList.add('active');
 
-    async function onMobileVerify(){
-      const num = mobile.value.trim();
-      if(!/^\d{11}$/.test(num)){ toast("Invalid mobile number", false); return; }
-      // NOTE: server expects mobile_no + captcha_token
-      const res = await postForm(URLS.mobileVerify, { mobile_no: num });
-      res.ok ? toast("Verification sent") : toast(res.msg || "Failed", false);
-    }
-    async function onLoginWithPassword(){
-      const num=mobile.value.trim(), pw=pass.value;
-      if(!/^\d{11}$/.test(num) || !pw){ toast("Mobile/password required", false); return; }
-      const res = await postForm(URLS.login, { mobile_no:num, password:pw });
-      if(res.ok){
-        bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
-        toast("Logged in (password) ✓");
-      } else toast(res.msg || "Login failed", false);
-    }
-    async function onLoginWithOtp(){
-      if(otpFlight){ toast("OTP verify in-progress", false); return; }
-      const num=mobile.value.trim(), code=otp.value.trim();
-      if(!/^\d{11}$/.test(num) || !/^\d{6}$/.test(code)){ toast("Mobile/OTP required", false); return; }
-      otpFlight = true;
-      try{
-        const res = await postForm(URLS.loginOtp, { mobile_no:num, otp:code });
-        if(res.ok){
-          bearerToken = res.data?.access_token || ""; kv.write("bearerToken", bearerToken);
-          toast("OTP verified! Token saved ✓");
-        } else toast(res.msg || "OTP failed", false);
-      } finally { otpFlight=false; }
-    }
-
-    return box;
-  }
-
-  function bgdView(){
-    const box = document.createElement("div"); box.style.display="none";
-
-    const note = input("Ready for BGD form submission"); note.disabled = true;
-    const tokenInp = tokenInput(); tokenInp.value = bearerToken;
-    tokenInp.oninput = ()=>{ bearerToken = tokenInp.value.trim(); kv.write("bearerToken", bearerToken); };
-
-    const rowA = row( button("APPLICATION","b-blue", submitApplication),
-                      button("PERSONAL","b-green", submitPersonal) );
-    const rowB = row( button("OVERVIEW","b-purple", submitOverview),
-                      button("SEND OTP","b-orange", ()=>sendPayOtp(false)) );
-
-    const otpInp = input("Enter 6-digit Payment OTP");
-    const rowC = row( button("RESEND OTP","b-blue", ()=>sendPayOtp(true)),
-                      button("AUTO","b-orange", ()=>sendPayOtp(true)) );
-    const rowD = row( button("VERIFY OTP","b-purple", verifyPayOtp),
-                      button("AUTO","b-orange", verifyPayOtp) );
-
-    const editBtn = button("ADD/EDIT DATA","b-purple", openDataModal);
-    const stopBtn = button("STOP ALL","b-red", stopAll);
-
-    box.append(note, tokenInp, rowA, rowB, otpInp, rowC, rowD, editBtn, stopBtn);
-
-    async function submitApplication(){
-      const res = await postForm(URLS.applicationSubmit, kv.read("applicationInfo"), true);
-      res.ok ? toast(res.msg || "Application submitted ✓") : toast(res.msg || "Application failed", false);
-    }
-    async function submitPersonal(){
-      const res = await postForm(URLS.personalSubmit, kv.read("personalInfo"), true);
-      res.ok ? toast(res.msg || "Personal submitted ✓") : toast(res.msg || "Personal failed", false);
-    }
-    async function submitOverview(){
-      const res = await postForm(URLS.overviewSubmit, {}, true);
-      res.ok ? toast(res.msg || "Overview submitted ✓") : toast(res.msg || "Overview failed", false);
-    }
-    async function sendPayOtp(resend=false){
-      const res = await postForm(URLS.payOtpSend, { resend: resend?1:0 }, true);
-      res.ok ? toast("Payment OTP sent") : toast(res.msg || "OTP send failed", false);
-    }
-    async function verifyPayOtp(){
-      if(otpFlight){ toast("OTP verify in-progress", false); return; }
-      const code = otpInp.value.trim();
-      if(!/^\d{6}$/.test(code)){ toast("Valid 6-digit OTP required", false); return; }
-      otpFlight = true;
-      try{
-        const res = await postForm(URLS.payOtpVerify, { otp: code }, true);
-        res.ok ? toast("Payment OTP verified ✓") : toast(res.msg || "OTP verify failed", false);
-      } finally { otpFlight=false; }
-    }
-
-    return box;
-  }
-
-  function payView(){
-    const box = document.createElement("div"); box.style.display="none";
-
-    const note = input("Ready for payment"); note.disabled = true;
-    const date = input("mm/dd/yyyy","date");
-    const rowA = row( button("GET SLOTS","b-blue", getSlots),
-                      button("AUTO","b-orange", getSlots) );
-    const rowB = row( button("PAY NOW","b-purple", payNow),
-                      button("AUTO","b-orange", payNow) );
-    const stopBtn = button("STOP ALL","b-red", stopAll);
-
-    box.append(note, date, rowA, rowB, stopBtn);
-
-    async function getSlots(){
-      const d = date.value; if(!d){ toast("Select date", false); return; }
-      const res = await postForm(URLS.slotTime, { appointment_date: d }, true);
-      if(res.ok){
-        const times = res.data?.slot_times || [];
-        toast(times.length? `Slots: ${times.join(", ")}` : "No slots", !!times.length);
-        kv.write("lastSlots", {date:d, times});
-      } else toast(res.msg || "Slot fetch failed", false);
-    }
-
-    async function payNow(){
-      const d = date.value; if(!d){ toast("Select date", false); return; }
-      const pick = (kv.read("lastSlots")?.times || [])[0] || "09:00 - 09:59";
-      const payload = {
-        appointment_date: d,
-        appointment_time: pick,
-        selected_payment: { name:"VISA", slug:"visacard", link:"https://securepay.sslcommerz.com/gwprocess/v4/image/gw1/visa.png" }
-      };
-      const res = await postForm(URLS.payNow, payload, true);
-      if(res.ok){
-        const url = res.data?.data?.url; if(url) window.open(url, "_blank");
-        toast("Payment init ✓");
-      } else toast(res.msg || "Pay failed", false);
-    }
-
-    return box;
-  }
-
-  /************** DATA MODAL (Add/Edit) **************/
-  function openDataModal(){
-    const modal = document.createElement("div"); modal.className="alx-modal";
-    const card = document.createElement("div"); card.className="alx-modal-card"; modal.appendChild(card);
-    const title = document.createElement("div"); title.className="alx-modal-title"; title.textContent="Custom Data Input"; card.appendChild(title);
-    const x = document.createElement("div"); x.className="alx-x"; x.textContent="✕"; card.appendChild(x); x.onclick=()=>modal.remove();
-
-    const fields = [
-      ["highcom","Application Info → highcom"],
-      ["webfile_id","Application Info → webfile_id"],
-      ["ivac_id","Application Info → ivac_id"],
-      ["visa_type","Application Info → visa_type"],
-      ["family_count","Application Info → family_count"],
-      ["visit_purpose","Application Info → visit_purpose"],
-      ["full_name","Personal → full_name"],
-      ["email_name","Personal → email"],
-      ["phone","Personal → phone"],
-    ];
-    const inputs = {};
-    fields.forEach(([k,lab])=>{
-      const i = document.createElement("input"); i.className="alx-input"; i.placeholder=lab; i.value = kv.read("data."+k,"");
-      inputs[k]=i; card.appendChild(i);
+        tabContents.forEach(content => {
+            content.style.display = content.id === `tab-content-${targetTab}` ? 'flex' : 'none';
+        });
     });
 
-    const save = button("Save Data","b-green",()=>{
-      const data = {};
-      Object.keys(inputs).forEach(k=> data[k]=inputs[k].value.trim());
-      const app = {
-        highcom: data.highcom||"1",
-        webfile_id: data.webfile_id||"",
-        webfile_id_repeat: data.webfile_id||"",
-        ivac_id: data.ivac_id||"",
-        visa_type: data.visa_type||"",
-        family_count: data.family_count||"0",
-        visit_purpose: data.visit_purpose||""
-      };
-      const per = {
-        full_name: data.full_name||"",
-        email_name: data.email_name||"",
-        phone: data.phone||"",
-        webfile_id: data.webfile_id||""
-      };
-      kv.write("applicationInfo", app);
-      kv.write("personalInfo", per);
-      toast("Saved ✓");
-      modal.remove();
+    // --- Helper Functions ---
+    function updateStatus(message, type = 'processing') {
+        const statusDisplay = document.getElementById('status-display');
+        const statusText = statusDisplay.querySelector('.status-text');
+        statusDisplay.className = ''; // Reset classes
+        if (type === 'success') statusDisplay.classList.add('status-success');
+        else if (type === 'error') statusDisplay.classList.add('status-error');
+        statusText.textContent = message;
+    }
+
+    function showUserProfile(name, photoUrl) {
+        const profileDiv = document.getElementById('user-profile');
+        const profileImg = document.getElementById('profile-img');
+        const profileName = document.getElementById('profile-name');
+        const panelTitle = document.querySelector('.panel-title');
+
+        if (name && photoUrl) {
+            profileImg.src = photoUrl;
+            profileName.textContent = name;
+            profileDiv.style.display = 'flex';
+            panelTitle.style.display = 'none';
+        }
+    }
+
+    async function makeRequest(endpoint, method = 'POST', payload = {}, description = "", useToken = true) {
+        updateStatus(`Processing: ${description}...`);
+        try {
+            const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+            if (useToken) {
+                const token = document.getElementById('auth-token-input').value.trim();
+                if (token) headers['Authorization'] = `Bearer ${token}`;
+            }
+
+            let finalPayload = { ...payload };
+            if (captcha_token && (
+                endpoint.includes('info-submit') ||
+                endpoint.includes('pay-now') ||
+                endpoint.includes('mobile-verify') ||
+                endpoint.includes('personal-info-submit') ||
+                endpoint.includes('pay-otp-sent')
+            )) {
+                finalPayload.captcha_token = captcha_token;
+                captcha_token = null; // Reset token after one-time use
+            }
+
+            const response = await fetch(`${API_BASE_URL}/${endpoint}`, {
+                method: method,
+                headers: headers,
+                body: (method === 'GET' || Object.keys(finalPayload).length === 0) ? null : JSON.stringify(finalPayload),
+            });
+
+            let result = null;
+            try { result = await response.json(); } catch(e) {}
+
+            if (!response.ok) {
+                throw new Error(result?.message || `${response.status} ${response.statusText}`);
+            }
+            if (result && result.status && result.status !== 'success') {
+                throw new Error(result.message || 'API reported failure');
+            }
+
+            updateStatus(`Success: ${description} ✓`, 'success');
+            return result;
+        } catch (error) {
+            updateStatus(`Error: ${error.message} ✗`, 'error');
+            return null;
+        }
+    }
+
+    // --- Main Event Handler ---
+    panel.addEventListener('click', async (event) => {
+        if (event.target.tagName !== 'BUTTON') return;
+        const buttonId = event.target.id;
+        const step = event.target.getAttribute('data-step');
+
+        // --- Login Tab Actions ---
+        switch (buttonId) {
+            case 'btn-solve-captcha-login':
+                if (await solveCloudflare("https://payment.ivacbd.com/login", "0x4AAAAAABpNUpzYeppBoYpe")) {
+                    document.getElementById('btn-mobile-verify').disabled = false;
+                }
+                break;
+
+            case 'btn-mobile-verify':
+                const mobile = document.getElementById('login-mobile').value.trim();
+                if (!mobile || !/^01\d{9}$/.test(mobile)) {
+                    return updateStatus('Invalid mobile number!', 'error');
+                }
+                const verifyResult = await makeRequest('mobile-verify', 'POST', { mobile_no: mobile }, 'Mobile Verification', false);
+                if (verifyResult) {
+                    document.getElementById('btn-send-otp-login').disabled = false;
+                }
+                break;
+
+            case 'btn-send-otp-login':
+                const loginMobile = document.getElementById('login-mobile').value.trim();
+                const password = document.getElementById('login-password').value.trim();
+                if (!loginMobile || !password) return updateStatus('Mobile and Password required!', 'error');
+                const otpResult = await makeRequest('login', 'POST', { mobile_no: loginMobile, password: password }, 'Send OTP', false);
+                if (otpResult) {
+                    document.getElementById('btn-login').disabled = false;
+                }
+                break;
+
+            case 'btn-login':
+                const finalMobile = document.getElementById('login-mobile').value.trim();
+                const finalPassword = document.getElementById('login-password').value.trim();
+                const otp = document.getElementById('login-otp').value.trim();
+                if (!finalMobile || !finalPassword || !otp) return updateStatus('All fields are required!', 'error');
+                const loginResult = await makeRequest('login-otp', 'POST', { mobile_no: finalMobile, password: finalPassword, otp: otp }, 'Login', false);
+
+                // FIXED: Correctly access the user data from the API response.
+                if (loginResult && loginResult.data && loginResult.data.access_token) {
+                    const userData = loginResult.data; // The user data is directly in loginResult.data
+                    const token = userData.access_token;
+
+                    // --- NEW: Save login data to localStorage for persistence ---
+                    localStorage.setItem('access_token', token);
+                    if (userData.name && userData.profile_image) {
+                        localStorage.setItem('auth_name', userData.name || '');
+                        localStorage.setItem('auth_photo', userData.profile_image || '');
+                        localStorage.setItem('auth_phone', userData.mobile_no || '');
+                        localStorage.setItem('auth_email', userData.email || '');
+                        showUserProfile(userData.name, userData.profile_image);
+                    }
+
+                    captureToken(token); // Capture and set token in the input field
+                    updateStatus('Login successful! Go to the Application tab.', 'success');
+                    tabContainer.querySelector('[data-tab="application"]').click(); // Automatically switch to the application tab
+                }
+                break;
+        }
+
+        // --- Application Tab Actions ---
+        switch (step) {
+            case 'app-info':
+                await makeRequest('payment/application-info-submit', 'POST', payloadData.applicationInfo, 'App Info');
+                break;
+
+            case 'personal-info':
+                await makeRequest('payment/personal-info-submit', 'POST', payloadData.personalInfo, 'Personal Info');
+                break;
+
+            case 'overview':
+                await makeRequest('payment/overview-submit', 'POST', {}, 'Overview');
+                break;
+
+            case 'cfs':
+                await solveCloudflare(window.location.href, "0x4AAAAAABpNUpzYeppBoYpe");
+                break;
+
+            case 'send-otp-app':
+                await makeRequest('payment/pay-otp-sent', 'POST', payloadData.sendOtp, 'App Send OTP');
+                break;
+
+            case 'verify-otp-app':
+                const appOtp = document.getElementById('otp-input-app').value.trim();
+                if (appOtp) {
+                    const result = await makeRequest('payment/pay-otp-verify', 'POST', { ...payloadData.sendOtp, otp: appOtp }, 'App Verify OTP');
+                    if (result && result.data) {
+                        if (result.data.access_token) captureToken(result.data.access_token);
+                        if (result.data.appointment_date) document.getElementById('slot-date-input').value = result.data.appointment_date;
+                    }
+                } else {
+                    updateStatus('Error: OTP is missing!', 'error');
+                }
+                break;
+
+            case 'get-slots':
+                const slotDate = document.getElementById('slot-date-input').value;
+                if (slotDate) {
+                    const slotResult = await makeRequest('payment/pay-slot-time', 'POST', { appointment_date: slotDate }, 'Get Slots');
+                    if (slotResult && slotResult.data) {
+                        hashParam = slotResult.data.hash_param || null;
+                        const timeSelect = document.getElementById('slot-time-select');
+                        timeSelect.innerHTML = '<option value="">Select Time</option>';
+                        slotResult.data.slot_times?.forEach(slot => {
+                            const option = document.createElement('option');
+                            option.value = slot.id || slot.uid;
+                            option.textContent = `${slot.time_display || 'N/A'} (${slot.availableSlot || 'N/A'})`;
+                            timeSelect.appendChild(option);
+                        });
+                        updateStatus('Slots loaded.', 'success');
+                    }
+                } else {
+                    updateStatus('Error: Please select a date first!', 'error');
+                }
+                break;
+
+            case 'pay-now':
+                const appointmentDate = document.getElementById('slot-date-input').value;
+                const timeSelect = document.getElementById('slot-time-select');
+                const selectedOption = timeSelect.options[timeSelect.selectedIndex];
+                if (!appointmentDate || !timeSelect.value) return updateStatus('Error: Date or Time missing!', 'error');
+                const paymentPayload = {
+                    appointment_date: appointmentDate,
+                    appointment_time: selectedOption.textContent.split('(')[0].trim(), // Send only the time part
+                    hash_param: hashParam,
+                    selected_payment: {
+                        "name": "VISA",
+                        "slug": "visacard",
+                        "link": "https://securepay.sslcommerz.com/gwprocess/v4/image/gw1/visa.png"
+                    }
+                };
+
+                const payResponse = await makeRequest('payment/pay-now', 'POST', paymentPayload, 'Payment');
+
+                if (payResponse && payResponse.data) {
+                    const redirectUrl = payResponse.data.redirect_url || payResponse.data.payment_url || payResponse.data.url;
+                    if (redirectUrl) {
+                        window.open(redirectUrl, '_blank');
+                        updateStatus('Payment initiated — opened in new tab.', 'success');
+                    } else {
+                        updateStatus('Error: No payment link received!', 'error');
+                    }
+                }
+                break;
+        }
     });
-    card.appendChild(save);
-    document.body.appendChild(modal);
-  }
 
-  /************** ENTRY **************/
-  buildUI();
-  startTurnstileWatcher(); // Turnstile detect + token capture
+    // --- Functions to run on script start ---
 
-  // keyboard shortcut
-  window.addEventListener("keydown", (e)=>{
-    if(e.altKey && (e.key==="d" || e.key==="D")){ openDataModal(); }
-  });
+    // Set captured token after panel loads
+    if (capturedTokenBeforePanel) {
+        document.getElementById('auth-token-input').value = capturedTokenBeforePanel;
+        lastKnownToken = capturedTokenBeforePanel;
+        capturedTokenBeforePanel = null;
+    }
 
-  // quick hooks
-  window.__IVAC__ = { openDataModal, stopAll, focusTurnstileWidget };
+    // NEW: Check for existing login on page load
+    (function checkExistingLogin() {
+        const token = localStorage.getItem('access_token');
+        const name = localStorage.getItem('auth_name');
+        const photo = localStorage.getItem('auth_photo');
+
+        if (token && name && photo) {
+            captureToken(token); // Populate the token field in the application tab
+            showUserProfile(name, photo); // Show user info in the header
+            updateStatus('Already logged in.', 'success');
+        }
+    })();
 
 })();
