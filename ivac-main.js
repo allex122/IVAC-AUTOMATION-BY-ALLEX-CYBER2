@@ -8,20 +8,6 @@
  * - OTP single-flight, STOP CURRENT/ALL, request de-dupe
  * - Hotkey: Alt + D → Data modal
  */
-
-// ==UserScript==
-// @name         Allex IVAC Automation
-// @namespace    https://github.com/YOUR_USERNAME/IVAC-AUTOMATION-BY-ALLEX-CYBER2
-// @version      3.3.0
-// @description  Robust IVAC automation using native form submission for Cloudflare bypass, fallback API routing, and a persistent data manager.
-// @author       Allex & Gemini
-// @match        https://payment.ivacbd.com/*
-// @grant        none
-// @updateURL    https://github.com/YOUR_USERNAME/IVAC-AUTOMATION-BY-ALLEX-CYBER2/raw/main/allex-ivac-automation.user.js
-// @downloadURL  https://github.com/YOUR_USERNAME/IVAC-AUTOMATION-BY-ALLEX-CYBER2/raw/main/allex-ivac-automation.user.js
-// @icon         https://www.google.com/s2/favicons?sz=64&domain=ivacbd.com
-// ==/UserScript==
-
 (() => {
     'use strict';
 
