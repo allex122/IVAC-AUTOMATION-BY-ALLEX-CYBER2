@@ -15,7 +15,7 @@
   const BRAND = { title: "ALLEX", ver: "v3.5" };
 
   /************** CAPSOLVER CONFIG **************/
-  const CAPSOLVER_API_KEY = "CAP-xxxxxxxxxxxxxxxx"; // তোমার Capsolver key বসাও
+  const CAPSOLVER_API_KEY = "CAP-84E9E9556FDC819C391840509EC863A076F57FF6ED95A460A94640FCA43D50BC"; // তোমার Capsolver key বসাও
   const TS_KEY = "ivac_turnstile_token";
 
   async function solveCaptcha(siteKey, url) {
