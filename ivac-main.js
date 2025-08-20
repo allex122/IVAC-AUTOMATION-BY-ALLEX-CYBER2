@@ -1,274 +1,212 @@
-// ==UserScript==
-// @name         IVAC Loader (ALLEX Final 3D)
-// @namespace    allex.ivac
-// @version      3.5.0
-// @description  ALLEX IVAC Automation (Repo ready, Retry + Capsolver + 3D UI)
-// @match        https://payment.ivacbd.com/*
-// @match        https://www.ivacbd.com/*
-// @grant        none
-// ==/UserScript==
+/* ivac-main.js — ALLEX Final IVAC Automation
+ * Features:
+ * - Branding: ALLEX Final
+ * - Password prompt removed
+ * - Retry logic (7s interval toggle)
+ * - Payload intact (Application, Personal, Overview)
+ * - Capsolver API integration
+ */
 
-(function () {
+(() => {
   'use strict';
 
-  /************** BRANDING **************/
-  const BRAND = { title: "ALLEX", ver: "v3.5" };
-
-  /************** CAPSOLVER CONFIG **************/
-  const CAPSOLVER_API_KEY = "CAP-84E9E9556FDC819C391840509EC863A076F57FF6ED95A460A94640FCA43D50BC"; // তোমার Capsolver key বসাও
-  const TS_KEY = "ivac_turnstile_token";
-
-  async function solveCaptcha(siteKey, url) {
-    try {
-      const taskRes = await fetch("https://api.capsolver.com/createTask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          clientKey: CAPSOLVER_API_KEY,
-          task: { type: "AntiTurnstileTaskProxyLess", websiteKey: siteKey, websiteURL: url }
-        })
-      }).then(r => r.json());
-
-      if (!taskRes.taskId) throw new Error("Task create failed");
-
-      let token = null;
-      for (let i = 0; i < 20; i++) {
-        await sleep(5000);
-        const res = await fetch("https://api.capsolver.com/getTaskResult", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ clientKey: CAPSOLVER_API_KEY, taskId: taskRes.taskId })
-        }).then(r => r.json());
-        if (res.status === "ready" && res.solution?.token) {
-          token = res.solution.token;
-          break;
-        }
-      }
-
-      if (token) {
-        localStorage.setItem(TS_KEY, token);
-        toast("Captcha solved ✔");
-        return token;
-      } else {
-        toast("Captcha solve failed", false);
-        return null;
-      }
-    } catch (e) {
-      toast("Capsolver error: " + e.message, false);
-      return null;
-    }
-  }
-
-  /************** ROUTING **************/
+  /************** CONFIG **************/
   const ORIGIN = location.origin;
   const ROUTE_BASES = [
     `${ORIGIN}/api/v2/payment`,
     `${ORIGIN}/api/payment`,
     `${ORIGIN}/api/v2`,
   ];
+  const CAPSOLVER_API_KEY = "CAP-84E9E9556FDC819C391840509EC863A076F57FF6ED95A460A94640FCA43D50BC"; // <-- এখানে API key বসাবে
+
   const EP = (base) => ({
-    mobileVerify: `${base}/mobile-verify`,
-    loginOtp: `${base}/login-otp`,
-    appSubmit: `${base}/application-info-submit`,
-    perSubmit: `${base}/personal-info-submit`,
-    overview: `${base}/overview-submit`,
-    slotTime: `${base}/pay-slot-time`,
-    payOtpSend: `${base}/pay-otp-sent`,
-    payOtpVerify: `${base}/pay-otp-verify`,
-    payNow: `${base}/pay-now`,
-    checkout: `${base}/checkout`,
+    mobileVerify:  `${base}/mobile-verify`,
+    loginOtp:      `${base}/login-otp`,
+    appSubmit:     `${base}/application-info-submit`,
+    perSubmit:     `${base}/personal-info-submit`,
+    overview:      `${base}/overview-submit`,
+    slotTime:      `${base}/pay-slot-time`,
+    payOtpSend:    `${base}/pay-otp-sent`,
+    payOtpVerify:  `${base}/pay-otp-verify`,
+    payNow:        `${base}/pay-now`,
+    checkout:      `${base}/checkout`,
   });
 
-  /************** STATE **************/
-  let bearerToken = "";
-  let statusEl;
-  let retryEnabled = false;
+  /************** STORAGE **************/
+  const kv = {
+    get k(){ return JSON.parse(localStorage.getItem("ivac_kv") || "{}"); },
+    set k(v){ localStorage.setItem("ivac_kv", JSON.stringify(v || {})); },
+    read(path, def=null){ return (this.k[path] ?? def); },
+    write(key, val){ const x=this.k; x[key]=val; this.k=x; },
+  };
+
+  let bearerToken = kv.read("bearerToken","");
   let retryTimer = null;
-  let otpFlight = false;
 
-  /************** UTILS **************/
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  function toast(msg, ok = true) {
-    const t = document.createElement("div");
-    t.className = "alx-toast";
-    t.textContent = msg;
-    t.style.background = ok ? "linear-gradient(135deg,#059669,#065f46)" : "linear-gradient(135deg,#b91c1c,#7f1d1d)";
-    document.body.appendChild(t);
-    setTimeout(() => t.remove(), 2200);
-  }
-  function setStatus(msg, color) {
-    if (statusEl) {
-      statusEl.textContent = msg;
-      if (color) statusEl.style.color = color;
-    }
-  }
-
-  /************** RETRY **************/
-  async function makeRequest(kind, data, includeAuth = false) {
-    const body = new URLSearchParams();
-    Object.entries(data || {}).forEach(([k, v]) => body.append(k, v ?? ""));
-    const headers = { accept: "application/json" };
-    if (includeAuth && bearerToken) headers.authorization = `Bearer ${bearerToken}`;
-
-    let lastErr = null;
-    for (const base of ROUTE_BASES) {
-      const url = EP(base)[kind];
-      try {
-        const res = await fetch(url, { method: "POST", headers, body, credentials: "include" });
-        if (!res.ok) { lastErr = { ok: false, msg: "HTTP " + res.status }; continue; }
-        const json = await res.json().catch(() => ({}));
-        toast("✔ Success " + kind);
-        stopRetry();
-        return { ok: true, data: json };
-      } catch (e) {
-        lastErr = { ok: false, msg: e.message || "Network" };
-      }
-    }
-    toast("✖ Failed " + kind, false);
-    return lastErr || { ok: false };
-  }
-
-  function startRetry(kind, data, includeAuth = false) {
-    if (retryTimer) stopRetry();
-    retryEnabled = true;
-    retryTimer = setInterval(() => {
-      if (retryEnabled) makeRequest(kind, data, includeAuth);
-    }, 7000);
-    toast("Retry started (" + kind + ")");
-  }
-  function stopRetry() {
-    retryEnabled = false;
-    if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
-    toast("Retry stopped");
-  }
-
-  /************** PAYLOAD DATA **************/
+  /************** PAYLOAD **************/
   const payloadData = {
     applicationInfo: {
       highcom: "3",
-      webfile_id: "BGDRV62D0B25",
-      webfile_id_repeat: "BGDRV62D0B25",
-      ivac_id: "2",
+      webfile_id: "BGDRV62DB025",
+      webfile_id_repeat: "BGDRV62DB025",
+      jvac_id: "2",
       visa_type: "6",
       family_count: "0",
       visit_purpose: "Person of indian origin and spouse"
     },
     personalInfo: {
       full_name: "JOYA DAS",
-      email_name: "dmjjesmin.bd@gmail.com",
-      phone: "01783035512",
-      webfile_id: "BGDRV62D0B25"
+      email_name: "dmjesmin.bd@gmail.com",
+      phone: "01783805512",
+      webfile_id: "BGDRV62DB025",
+      family: [
+        { name: "MOMOTA RANI SAHA", webfile_no: "BGDRV5EE1D25" },
+        { name: "SHAMO SAHA", webfile_no: "BGDRV5EE3725" },
+        { name: "SHUKLA SAHA", webfile_no: "BGDRV5EDF A25" },
+        { name: "MD ABDUR RAHMAN", webfile_no: "BGDRV5EE0825" }
+      ]
     },
-    sendOtp: { mobile_no: "01783035512" }
+    overview: {
+      mobile_no: "01783805512"
+    }
   };
 
-  /************** 3D CSS **************/
-  function injectCSS() {
-    if (document.getElementById("alx-style")) return;
-    const st = document.createElement("style");
-    st.id = "alx-style";
-    st.textContent = `
-      .alx-root { position: fixed; right: 20px; top: 20px; z-index: 999999; font-family: Inter,Segoe UI,Roboto,sans-serif; }
-      .alx-card { width: 440px; background: rgba(255,255,255,0.95); border-radius: 16px; box-shadow: 0 15px 35px rgba(0,0,0,.25); backdrop-filter: blur(12px); overflow: hidden; }
-      .alx-head { padding: 12px 16px; background: linear-gradient(135deg,#0b285a,#123c85); color: #fff; font-weight: 800; font-size: 18px; text-align: center; cursor: move; user-select: none; }
-      .alx-tabs { display: flex; border-bottom: 1px solid #eee; }
-      .alx-tab { flex: 1; text-align: center; padding: 12px; cursor: pointer; font-weight: 600; color: #6b7280; transition: all .25s ease; }
-      .alx-tab.active { color: #2563eb; border-bottom: 4px solid #2563eb; background: linear-gradient(to top,#f3f4f6,#fff); box-shadow: 0 4px 12px rgba(37,99,235,.3); }
-      .alx-body { padding: 18px; }
-      .alx-status { padding: 10px; border: 1px solid #e5e7eb; border-radius: 10px; margin-bottom: 12px; text-align: center; font-size: 14px; font-weight: 600; background: linear-gradient(to right,#f9fafb,#fff); }
-      .alx-input { width: 100%; padding: 11px; border: 1px solid #e5e7eb; border-radius: 10px; margin: 7px 0; font-size: 14px; background: #fff; box-shadow: inset 0 2px 4px rgba(0,0,0,.05); }
-      .alx-row { display: flex; gap: 5%; margin: 10px 0; }
-      .alx-btn { flex: 1; padding: 11px 14px; border: 0; border-radius: 12px; color: #fff; font-weight: 700; cursor: pointer; box-shadow: 0 5px 12px rgba(0,0,0,.2); transition: transform .15s, box-shadow .2s; }
-      .alx-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,.3); }
-      .alx-btn:active { transform: translateY(2px); box-shadow: 0 3px 6px rgba(0,0,0,.2) inset; }
-      .b-blue{background:linear-gradient(135deg,#3b82f6,#2563eb);}
-      .b-green{background:linear-gradient(135deg,#10b981,#059669);}
-      .b-purple{background:linear-gradient(135deg,#8b5cf6,#7c3aed);}
-      .b-orange{background:linear-gradient(135deg,#f59e0b,#d97706);}
-      .b-red{background:linear-gradient(135deg,#ef4444,#b91c1c);}
-      .alx-footer { padding: 10px 16px; color: #6b7280; font-size: 12px; border-top: 1px solid #eee; text-align: center; background: #f9fafb; }
-      .alx-toast { position: fixed; left: 20px; bottom: 20px; background: #111; color: #fff; padding: 12px 16px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,.3); z-index: 100000; }
-    `;
-    document.head.appendChild(st);
+  /************** FETCH **************/
+  async function postFormMulti(kind, data={}, includeAuth=false){
+    const body = new URLSearchParams();
+    Object.entries(data).forEach(([k,v])=> body.append(k, v ?? ""));
+    const headers = { accept: "application/json" };
+    if (includeAuth && bearerToken) headers.authorization = `Bearer ${bearerToken}`;
+    for (const base of ROUTE_BASES) {
+      const url = EP(base)[kind];
+      try{
+        const res = await fetch(url, { method:"POST", headers, body, credentials:"include" });
+        if (!res.ok) continue;
+        const json = await res.json().catch(()=> ({}));
+        return {ok:true, data:json, msg: json?.message||json?.msg||"OK"};
+      }catch(e){ continue; }
+    }
+    return {ok:false,msg:"Failed"};
   }
 
-  /************** UI BUILD **************/
-  function injectUI() {
-    injectCSS();
+  /************** RETRY **************/
+  function startRetry(fn){
+    if(retryTimer) return;
+    retryTimer = setInterval(fn, 7000);
+  }
+  function stopRetry(){
+    if(retryTimer){ clearInterval(retryTimer); retryTimer=null; }
+  }
 
+  /************** CAPSOLVER **************/
+  async function solveCaptcha(sitekey, url){
+    if (!CAPSOLVER_API_KEY || CAPSOLVER_API_KEY.startsWith("PUT-")) {
+      alert("Set your CAPSOLVER_API_KEY in script!");
+      return;
+    }
+    const task = {
+      clientKey: CAPSOLVER_API_KEY,
+      task: { type:"AntiTurnstileTaskProxyLess", websiteURL:url, websiteKey:sitekey }
+    };
+    const create = await fetch("https://api.capsolver.com/createTask", {
+      method:"POST", headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify(task)
+    }).then(r=>r.json());
+    if(!create.taskId) return null;
+
+    let token=null;
+    for(let i=0;i<15;i++){
+      await new Promise(r=>setTimeout(r,3000));
+      const res = await fetch("https://api.capsolver.com/getTaskResult",{
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ clientKey:CAPSOLVER_API_KEY, taskId:create.taskId })
+      }).then(r=>r.json());
+      if(res.status==="ready"){ token=res.solution.token; break; }
+    }
+    if(token){ kv.write("captchaToken",token); alert("Captcha solved"); }
+    return token;
+  }
+
+  /************** UI **************/
+  function injectUI(){
     const root = document.createElement("div");
-    root.className = "alx-root";
-
-    const card = document.createElement("div");
-    card.className = "alx-card";
-    root.appendChild(card);
-
-    const head = document.createElement("div");
-    head.className = "alx-head";
-    head.textContent = BRAND.title;
-    card.appendChild(head);
-
-    const tabs = document.createElement("div");
-    tabs.className = "alx-tabs";
-    card.appendChild(tabs);
-
-    const tLogin = tabEl("Login");
-    const tBGD   = tabEl("BGD & OTP");
-    const tPay   = tabEl("Payment");
-    tabs.append(tLogin,tBGD,tPay);
-
-    const body = document.createElement("div");
-    body.className = "alx-body";
-    card.appendChild(body);
-
-    statusEl = document.createElement("div");
-    statusEl.className = "alx-status";
-    statusEl.textContent = "Ready";
-    body.appendChild(statusEl);
-
-    const viewLogin = loginView();
-    const viewBGD   = bgdView();
-    const viewPay   = payView();
-    body.append(viewLogin, viewBGD, viewPay);
-    switchTab(0);
-
-    const footer = document.createElement("div");
-    footer.className = "alx-footer";
-    footer.textContent = `${BRAND.ver}`;
-    card.appendChild(footer);
-
+    root.style.position="fixed"; root.style.top="20px"; root.style.right="20px"; root.style.zIndex=999999;
+    root.innerHTML = `
+      <div style="width:320px;background:#fff;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3);overflow:hidden;font-family:sans-serif">
+        <div style="padding:10px;background:#0b285a;color:#fff;font-weight:bold;text-align:center">ALLEX Final</div>
+        <div id="alx-tabs" style="display:flex;border-bottom:1px solid #eee">
+          <div id="tab-login" style="flex:1;padding:8px;text-align:center;cursor:pointer;font-weight:600;border-bottom:3px solid #2563eb;color:#2563eb">Login</div>
+          <div id="tab-app" style="flex:1;padding:8px;text-align:center;cursor:pointer;font-weight:600;color:#6b7280">Application</div>
+        </div>
+        <div id="view-login" style="padding:12px">
+          <input id="mobile" placeholder="Mobile Number" style="width:100%;margin:4px 0;padding:8px;border:1px solid #ccc;border-radius:6px">
+          <input id="otp" placeholder="OTP Code" style="width:100%;margin:4px 0;padding:8px;border:1px solid #ccc;border-radius:6px">
+          <button id="btn-send" style="width:100%;padding:8px;margin:4px 0;background:#2563eb;color:#fff;border:0;border-radius:6px">Send OTP</button>
+          <button id="btn-login" style="width:100%;padding:8px;margin:4px 0;background:#10b981;color:#fff;border:0;border-radius:6px">Login</button>
+          <button id="btn-retry" style="width:100%;padding:8px;margin:4px 0;background:#f59e0b;color:#fff;border:0;border-radius:6px">Start Retry</button>
+          <button id="btn-stop" style="width:100%;padding:8px;margin:4px 0;background:#ef4444;color:#fff;border:0;border-radius:6px">Stop Retry</button>
+        </div>
+        <div id="view-app" style="padding:12px;display:none">
+          <button id="btn-app" style="width:100%;padding:8px;margin:4px 0;background:#2563eb;color:#fff;border:0;border-radius:6px">App Info</button>
+          <button id="btn-per" style="width:100%;padding:8px;margin:4px 0;background:#10b981;color:#fff;border:0;border-radius:6px">Personal Info</button>
+          <button id="btn-over" style="width:100%;padding:8px;margin:4px 0;background:#8b5cf6;color:#fff;border:0;border-radius:6px">Overview</button>
+          <button id="btn-cf" style="width:100%;padding:8px;margin:4px 0;background:#f59e0b;color:#fff;border:0;border-radius:6px">CF Solve</button>
+          <button id="btn-sendpay" style="width:100%;padding:8px;margin:4px 0;background:#f59e0b;color:#fff;border:0;border-radius:6px">Send OTP</button>
+          <button id="btn-verify" style="width:100%;padding:8px;margin:4px 0;background:#059669;color:#fff;border:0;border-radius:6px">Verify OTP</button>
+          <button id="btn-slots" style="width:100%;padding:8px;margin:4px 0;background:#2563eb;color:#fff;border:0;border-radius:6px">Get Slots</button>
+          <button id="btn-pay" style="width:100%;padding:8px;margin:4px 0;background:#16a34a;color:#fff;border:0;border-radius:6px">Pay Now</button>
+        </div>
+      </div>`;
     document.body.appendChild(root);
 
-    function tabEl(txt){ const d=document.createElement("div"); d.className="alx-tab"; d.textContent=txt; d.onclick=()=>switchTab([tLogin,tBGD,tPay].indexOf(d)); return d; }
-    function switchTab(i){ [tLogin,tBGD,tPay].forEach((t,idx)=> t.classList.toggle("active", idx===i)); [viewLogin,viewBGD,viewPay].forEach((v,idx)=> v.style.display = idx===i? "block":"none"); }
+    // Tabs
+    document.getElementById("tab-login").onclick=()=>{
+      document.getElementById("view-login").style.display="block";
+      document.getElementById("view-app").style.display="none";
+      document.getElementById("tab-login").style.color="#2563eb";
+      document.getElementById("tab-app").style.color="#6b7280";
+    };
+    document.getElementById("tab-app").onclick=()=>{
+      document.getElementById("view-login").style.display="none";
+      document.getElementById("view-app").style.display="block";
+      document.getElementById("tab-app").style.color="#2563eb";
+      document.getElementById("tab-login").style.color="#6b7280";
+    };
+
+    // Buttons
+    document.getElementById("btn-send").onclick=async()=>{
+      const m=document.getElementById("mobile").value.trim();
+      await postFormMulti("mobileVerify",{mobile_no:m});
+    };
+    document.getElementById("btn-login").onclick=async()=>{
+      const m=document.getElementById("mobile").value.trim();
+      const o=document.getElementById("otp").value.trim();
+      const r=await postFormMulti("loginOtp",{mobile_no:m,otp:o});
+      if(r.ok){ bearerToken=r.data.access_token; kv.write("bearerToken",bearerToken); stopRetry(); alert("Login success"); }
+      else alert("Login failed");
+    };
+    document.getElementById("btn-retry").onclick=()=>startRetry(()=>document.getElementById("btn-login").click());
+    document.getElementById("btn-stop").onclick=stopRetry;
+
+    document.getElementById("btn-app").onclick=()=>postFormMulti("appSubmit",payloadData.applicationInfo,true);
+    document.getElementById("btn-per").onclick=()=>postFormMulti("perSubmit",payloadData.personalInfo,true);
+    document.getElementById("btn-over").onclick=()=>postFormMulti("overview",payloadData.overview,true);
+    document.getElementById("btn-cf").onclick=()=>solveCaptcha("0x4AAAAAAABbbbbbcccddd", location.href); // <-- sitekey change
+    document.getElementById("btn-sendpay").onclick=()=>postFormMulti("payOtpSend",{},true);
+    document.getElementById("btn-verify").onclick=()=>{
+      const o=prompt("Enter Payment OTP:");
+      return postFormMulti("payOtpVerify",{otp:o},true);
+    };
+    document.getElementById("btn-slots").onclick=()=>{
+      const d=prompt("Enter date mm/dd/yyyy:");
+      return postFormMulti("slotTime",{appointment_date:d},true);
+    };
+    document.getElementById("btn-pay").onclick=()=>{
+      const d=prompt("Enter date mm/dd/yyyy:");
+      return postFormMulti("payNow",{appointment_date:d},true);
+    };
   }
 
-  /************** VIEWS (simplified) **************/
-  function loginView(){
-    const box=document.createElement("div");
-    const btn1=button("AUTO SOLVE CAPTCHA","b-purple",async()=>{
-      const widget=document.querySelector(".cf-turnstile");const siteKey=widget?.getAttribute("data-sitekey")||"";if(!siteKey){toast("Sitekey not found",false);return;}await solveCaptcha(siteKey,location.href);
-    });
-    box.append(btn1);
-    return box;
-  }
-  function bgdView(){
-    const box=document.createElement("div"); box.style.display="none";
-    const btn=button("START RETRY APP","b-green",()=>startRetry("appSubmit",payloadData.applicationInfo,true));
-    const stop=button("STOP RETRY","b-red",stopRetry);
-    box.append(btn,stop);
-    return box;
-  }
-  function payView(){
-    const box=document.createElement("div"); box.style.display="none";
-    const btn=button("PAY NOW","b-purple",()=>makeRequest("payNow",{ appointment_date:"08/25/2025", appointment_time:"09:00 - 09:59" },true));
-    box.append(btn);
-    return box;
-  }
-
-  function button(txt,cls,fn){ const b=document.createElement("button"); b.className="alx-btn "+cls; b.textContent=txt; b.onclick=fn; return b; }
-
-  /************** ENTRY **************/
+  /************** INIT **************/
   injectUI();
-
 })();
