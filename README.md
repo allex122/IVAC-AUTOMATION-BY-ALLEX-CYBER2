@@ -6,8 +6,7 @@
 ---
 
 ## ✨ Features
-- 🏷 **Branding** → ALLEX (floating panel, footer, title সব জায়গায়)  
-- 🔑 **Password remove** → আর browser password popup দরকার হবে না  
+- 🏷 **Branding** → ALLEX (floating panel, footer, title সব জায়গায়)   
 - ♻ **Retry system** → auto retry প্রতি **7 সেকেন্ড** পর পর (ON/OFF toggle + STOP button)  
 - 🤖 **Captcha Auto Solve** → [Capsolver](https://capsolver.com/) API দিয়ে Turnstile bypass  
 - 📌 **Floating draggable panel** with **3D UI**  
